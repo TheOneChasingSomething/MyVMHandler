@@ -1,0 +1,93 @@
+---
+- name: Bake Kali golden image
+  hosts: all
+  become: true
+  vars:
+    kali_metapackage: kali-linux-headless
+    full_upgrade: false      # set true to patch fully at bake time (slower)
+    enable_gui_vnc: false    # set true (or -e / Packer var) to bake the VNC stack
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Full upgrade (optional)
+      ansible.builtin.apt:
+        upgrade: full
+      when: full_upgrade | bool
+
+    - name: Install cloud-init, guest agent, python
+      ansible.builtin.apt:
+        name:
+          - cloud-init
+          - qemu-guest-agent
+          - python3
+        state: present
+
+    - name: Install the chosen Kali metapackage
+      ansible.builtin.apt:
+        name: "{{ kali_metapackage }}"
+        state: present
+
+    # ---- Remote GUI access (see runbook §6) ----
+    # No restart/notify here on purpose: the generalization tasks below delete
+    # the SSH host keys, and a sshd restart after that would fail (no host keys).
+    # X11Forwarding takes effect at the next boot of each deployed clone, and
+    # cloud-init regenerates the host keys on first boot.
+    - name: Enable X11 forwarding in sshd
+      ansible.builtin.replace:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*X11Forwarding\s+.*$'
+        replace: 'X11Forwarding yes'
+
+    - name: Install X11-forwarding essentials + a browser
+      ansible.builtin.apt:
+        name:
+          - xauth
+          - x11-utils
+          - firefox-esr
+        state: present
+
+    - name: Install VNC session stack (optional)
+      ansible.builtin.apt:
+        name:
+          - x11vnc
+          - xvfb
+          - fluxbox
+        state: present
+      when: enable_gui_vnc | default(false) | bool
+
+    - name: Enable core services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - ssh
+        - qemu-guest-agent
+
+    - name: Pin cloud-init to the NoCloud datasource (Terraform injects config)
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/90_datasource.cfg
+        content: "datasource_list: [ NoCloud, ConfigDrive, None ]\n"
+
+    # ---- Generalise so every Terraform clone is unique ----
+    - name: Truncate machine-id
+      ansible.builtin.copy:
+        dest: /etc/machine-id
+        content: ""
+
+    - name: Remove dbus machine-id
+      ansible.builtin.file:
+        path: /var/lib/dbus/machine-id
+        state: absent
+
+    - name: Remove SSH host keys (regenerated on first boot)
+      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_*
+      args:
+        removes: /etc/ssh/ssh_host_ed25519_key
+
+    - name: Clean apt caches
+      ansible.builtin.apt:
+        autoclean: true
+        autoremove: true

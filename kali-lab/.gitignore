@@ -1,0 +1,14 @@
+# Packer build artifacts
+build/output-kali/
+build/manifest.json
+build/packer_cache/
+
+# Terraform state and local config
+deploy/.terraform/
+deploy/.terraform.lock.hcl
+deploy/terraform.tfstate
+deploy/terraform.tfstate.backup
+deploy/terraform.tfvars
+
+# Golden image
+*.qcow2
