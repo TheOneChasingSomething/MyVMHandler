@@ -109,7 +109,7 @@ they work on any deployed domain (not just the last one).
 | `VARIANT` | `installer` | ISO flavour (`installer`, `installer-netinst`, `installer-everything`, `live`) |
 | `BROWSER` | `firefox-esr` | Browser launched by `make gui` |
 | `TF`      | `terraform` | IaC binary (`TF=tofu` to use OpenTofu) |
-| `POOL_DIR`| `/var/lib/libvirt/images` | libvirt default pool path |
+| `POOL`    | `default` | libvirt storage pool name |
 
 Example: `make bake GUI=true META=kali-linux-core VARIANT=installer-netinst`
 
@@ -187,9 +187,10 @@ GUI bits, and generalizes the image. Output: `build/output-kali/kali-golden.qcow
 
 ### 3. Install
 
-`make install` copies the golden qcow2 into the libvirt pool
-(`/var/lib/libvirt/images/`) and refreshes the pool so libvirt sees it. This step
-is required before `deploy` — Terraform's base volume reads that file.
+`make install` uploads the golden qcow2 into the libvirt pool as `$(GOLDEN).qcow2`
+**via the libvirt API** (`virsh vol-create-as` + `vol-upload`) — no `sudo`, and the
+volume is owned by libvirt so there are no permission surprises later. This step is
+required before `deploy`, which backs each VM's disk onto that volume.
 
 ### 4. Deploy
 

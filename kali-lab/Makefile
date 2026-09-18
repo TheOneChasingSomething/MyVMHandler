@@ -25,11 +25,12 @@ GUI        ?= false
 DESKTOP    ?= false
 VERBOSE    ?= false
 VARIANT    ?= installer
-POOL_DIR   ?= /var/lib/libvirt/images
+POOL       ?= default
 GOLDEN     ?= kali-golden
 SSH_USER   ?= kali
 BROWSER    ?= firefox-esr
 VM         ?= kali-lab-01
+SNAP       ?= clean
 VENV       ?= venv
 TF         ?= terraform
 TF_VERSION ?= 1.15.8
@@ -46,17 +47,17 @@ ACTIVATE = if [ -f $(VENV)/bin/activate ]; then . $(VENV)/bin/activate; elif [ -
 
 # Resolve the VM's CURRENT IP live: qemu-guest-agent first, then DHCP lease, then
 # the (possibly stale) Terraform output. One line so it works inside a recipe.
-LIVE_IP = ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null | awk '/ipv4/{split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(VM) --source lease 2>/dev/null | awk '/ipv4/{split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip 2>/dev/null)
+LIVE_IP = ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(VM) --source lease 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip 2>/dev/null)
 
 BUILD_DIR   := build
 DEPLOY_DIR  := deploy
 # Packer always writes this fixed file; the flavour (headless/desktop) is chosen
-# at bake via DESKTOP=. `install` copies it into the pool under $(GOLDEN).qcow2,
-# so several named goldens can coexist and `deploy GOLDEN=` picks which to clone.
+# at bake via DESKTOP=. `install` uploads it into the pool as $(GOLDEN).qcow2 via
+# the libvirt API (no sudo), so several named goldens can coexist and
+# `deploy GOLDEN=` picks which to clone.
 PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
-GOLDEN_DST  := $(POOL_DIR)/$(GOLDEN).qcow2
 
-.PHONY: help check tools ensure-terraform venv iso bake install deploy ip ssh gui smoke all start stop reboot restart status autostart destroy clean validate
+.PHONY: help check tools ensure-terraform venv iso bake install deploy ip ssh gui smoke all start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -138,21 +139,27 @@ bake: iso ## Fetch latest ISO, then build the golden qcow2 (META=, GUI=, VARIANT
 	    -var 'enable_desktop=$(DESKTOP)' \
 	    -var 'ansible_verbose=$(VERBOSE)' .
 
-install: ## Copy the baked image into the pool as $(GOLDEN).qcow2 (needs sudo)
+install: ## Upload the baked image into the pool as $(GOLDEN).qcow2 (no sudo, via libvirt)
 	@test -f $(PACKER_OUT) || { echo "!! $(PACKER_OUT) introuvable — lance 'make bake' d'abord"; exit 1; }
-	sudo cp $(PACKER_OUT) $(GOLDEN_DST)
-	sudo chown libvirt-qemu:libvirt-qemu $(GOLDEN_DST)
-	-@virsh -c qemu:///system pool-refresh default >/dev/null 2>&1
-	@echo ">> Installé : $(GOLDEN_DST)"
+	@bytes=$$(stat -c%s $(PACKER_OUT)); \
+	  if virsh -c qemu:///system vol-info --pool $(POOL) $(GOLDEN).qcow2 >/dev/null 2>&1; then \
+	    virsh -c qemu:///system vol-delete --pool $(POOL) $(GOLDEN).qcow2 \
+	      || { echo "[!] $(GOLDEN).qcow2 est utilisé (VM active ?) — 'make destroy VM=...' d'abord"; exit 1; }; \
+	  fi; \
+	  virsh -c qemu:///system vol-create-as $(POOL) $(GOLDEN).qcow2 $$bytes --format qcow2 && \
+	  echo ">> Upload $(PACKER_OUT) → $(POOL)/$(GOLDEN).qcow2 (patientez, ~taille de l'image)…" && \
+	  virsh -c qemu:///system vol-upload --pool $(POOL) $(GOLDEN).qcow2 $(PACKER_OUT) && \
+	  virsh -c qemu:///system pool-refresh $(POOL) >/dev/null && \
+	  echo ">> Installé (sans sudo) : $(POOL)/$(GOLDEN).qcow2"
 
 deploy: ensure-terraform ## Deploy a VM (VM=<name> → its own Terraform workspace)
-	@test -f $(GOLDEN_DST) || sudo test -f $(GOLDEN_DST) \
-	  || { echo "[!] image dorée absente du pool ($(GOLDEN_DST)) — lance 'make install' (après 'make bake')"; exit 1; }
+	@virsh -c qemu:///system vol-info --pool $(POOL) $(GOLDEN).qcow2 >/dev/null 2>&1 \
+	  || { echo "[!] golden '$(GOLDEN).qcow2' absent du pool '$(POOL)' — lance 'make install GOLDEN=$(GOLDEN)'"; exit 1; }
 	# One Terraform workspace per VM so several VMs coexist, each in its own state.
 	# -upgrade re-selects the provider if the constraint changed (libvirt 0.8.x pin).
 	cd $(DEPLOY_DIR) && $(TF) init -upgrade && \
 	  { $(TF) workspace select $(VM) 2>/dev/null || $(TF) workspace new $(VM); } && \
-	  $(TF) apply -auto-approve -var 'vm_name=$(VM)' -var 'golden_volume=$(GOLDEN).qcow2'
+	  $(TF) apply -auto-approve -var 'vm_name=$(VM)' -var 'golden_volume=$(GOLDEN).qcow2' -var 'pool=$(POOL)'
 
 ip: ## Print the VM's current IP (guest agent → lease → TF output)
 	@$(LIVE_IP); echo "$$ip"
@@ -173,7 +180,7 @@ smoke: ## Non-interactive connectivity + identity check
 	  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 	      $(SSH_USER)@$$ip 'echo "OK: $$(hostname) — $$(grep PRETTY_NAME /etc/os-release | cut -d= -f2)"'
 
-all: bake install deploy smoke ## Full pipeline: bake -> install -> deploy -> smoke
+all: bake install deploy smoke ## Full pipeline: bake -> install -> deploy -> smoke (no sudo)
 
 # ---- VM lifecycle (virsh on the persistent domain, no Terraform needed) ----
 start: ## Start the VM if it is stopped
@@ -196,6 +203,21 @@ status: ## Show VM state and current IP
 
 autostart: ## Start the VM automatically at host boot
 	virsh -c qemu:///system autostart $(VM)
+
+# ---- Snapshots (SNAP=<name>, default 'clean') ----
+snapshot: ## Take a snapshot (running VM → also captures RAM = full checkpoint)
+	virsh -c qemu:///system snapshot-create-as $(VM) "$(SNAP)" "created $$(date +%F_%T)"
+	@echo ">> snapshot '$(SNAP)' de $(VM) créé"
+
+snapshots: ## List the VM's snapshots
+	virsh -c qemu:///system snapshot-list $(VM)
+
+revert: ## Revert the VM to a snapshot (SNAP=<name>)
+	virsh -c qemu:///system snapshot-revert $(VM) "$(SNAP)"
+	@echo ">> $(VM) restauré sur '$(SNAP)'"
+
+snapshot-delete: ## Delete a snapshot (SNAP=<name>)
+	virsh -c qemu:///system snapshot-delete $(VM) "$(SNAP)"
 
 destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
 	cd $(DEPLOY_DIR) && { $(TF) workspace select $(VM) 2>/dev/null \
