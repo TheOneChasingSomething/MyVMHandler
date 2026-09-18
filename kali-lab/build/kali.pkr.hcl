@@ -39,6 +39,14 @@ variable "enable_gui_vnc" {
   default     = false
 }
 
+# When true, bake a full XFCE desktop + lightdm (shown by SPICE/virt-viewer),
+# in addition to the tool metapackage. Heavier and slower than the headless build.
+variable "enable_desktop" {
+  type        = bool
+  description = "Bake a full XFCE desktop into the image"
+  default     = false
+}
+
 # When true, run Ansible with -vvvv (task/module detail). NB: this does NOT
 # stream apt's own download progress — the apt module buffers until it returns.
 # To watch apt live, SSH/VNC into the guest and `tail -f /var/log/dpkg.log`.
@@ -130,7 +138,7 @@ build {
     # was the long one (usually the metapackage install).
     ansible_env_vars = ["ANSIBLE_CALLBACKS_ENABLED=profile_tasks"]
     extra_arguments = concat(
-      ["--extra-vars", "kali_metapackage=${var.metapackage} enable_gui_vnc=${var.enable_gui_vnc}"],
+      ["--extra-vars", "kali_metapackage=${var.metapackage} enable_gui_vnc=${var.enable_gui_vnc} enable_desktop=${var.enable_desktop}"],
       var.ansible_verbose ? ["-vvvv"] : []
     )
   }

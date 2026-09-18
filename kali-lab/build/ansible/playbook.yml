@@ -6,6 +6,7 @@
     kali_metapackage: kali-linux-headless
     full_upgrade: false      # set true to patch fully at bake time (slower)
     enable_gui_vnc: false    # set true (or -e / Packer var) to bake the VNC stack
+    enable_desktop: false    # set true to bake a full XFCE desktop (SPICE/virt-viewer)
 
   tasks:
     - name: Update apt cache
@@ -57,6 +58,27 @@
           - fluxbox
         state: present
       when: enable_gui_vnc | default(false) | bool
+
+    # ---- Full XFCE desktop (optional) — shown by SPICE/virt-viewer ----
+    - name: Install XFCE desktop + display manager (optional)
+      ansible.builtin.apt:
+        name:
+          - kali-desktop-xfce   # full Kali XFCE desktop
+          - lightdm             # display manager (graphical login)
+          - spice-vdagent       # SPICE integration (clipboard, resolution)
+        state: present
+      when: enable_desktop | default(false) | bool
+
+    - name: Boot to the graphical target and enable lightdm (optional)
+      when: enable_desktop | default(false) | bool
+      block:
+        - name: Default to graphical.target
+          ansible.builtin.command: systemctl set-default graphical.target
+          changed_when: false
+        - name: Enable lightdm at boot
+          ansible.builtin.systemd:
+            name: lightdm
+            enabled: true
 
     - name: Enable core services
       ansible.builtin.systemd:

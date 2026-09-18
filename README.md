@@ -69,9 +69,9 @@ Or step by step:
 
 ```bash
 make bake         # fetch latest ISO, then build the golden qcow2
-make install      # copy the image into the libvirt pool (sudo)
-make deploy       # terraform init + apply (auto-installs Terraform if missing)
-make ip           # print the VM's leased IP
+make install      # copy the image into the libvirt pool as $(GOLDEN).qcow2 (sudo)
+make deploy       # terraform apply (per-VM workspace; auto-installs Terraform if missing)
+make ip           # print the VM's current IP (live, via the guest agent)
 make smoke        # non-interactive SSH identity check
 make ssh          # interactive SSH session
 make destroy      # tear the VM down
@@ -85,25 +85,61 @@ make destroy      # tear the VM down
 | `tools`  | Install Packer + Terraform system-wide via HashiCorp's apt repo (sudo) |
 | `venv`   | Create `./venv` and install Ansible from `requirements.txt` |
 | `iso`    | Resolve the latest Kali ISO into `build/iso.auto.pkrvars.hcl` |
-| `bake`   | Fetch latest ISO, then build the golden qcow2 |
-| `install`| Copy the baked image into the libvirt pool and refresh it |
-| `deploy` | `terraform init -upgrade` + `apply` (installs Terraform locally if absent) |
-| `ip` / `ssh` / `smoke` | Print IP / interactive session / non-interactive check |
+| `bake`   | Fetch latest ISO, then build the golden qcow2 (flavour set by `DESKTOP`/`GUI`/`META`) |
+| `install`| Copy the baked image into the pool as `$(GOLDEN).qcow2` and refresh it |
+| `deploy` | Deploy `VM=<name>` from `GOLDEN=<name>` in its own Terraform workspace |
+| `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a browser over X11 / non-interactive check |
+| `start` / `stop` / `reboot` / `restart` / `status` / `autostart` | VM lifecycle via `virsh` (all honour `VM=`) |
 | `all`    | `bake → install → deploy → smoke` |
-| `destroy` / `clean` | Destroy the VM / remove local build artifacts |
+| `destroy` / `clean` | Destroy `VM=<name>` (its workspace) / remove local build artifacts |
+
+All VM-facing targets accept `VM=<name>` and resolve the live IP from libvirt, so
+they work on any deployed domain (not just the last one).
 
 ### Tunable variables (override on the command line)
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `META`    | `kali-linux-headless` | Kali metapackage to install |
+| `DESKTOP` | `false` | Bake a full XFCE desktop + lightdm (view via SPICE/virt-viewer) |
 | `GUI`     | `false` | Also bake the VNC session stack (x11vnc, xvfb, fluxbox) |
+| `GOLDEN`  | `kali-golden` | Pool volume name to install to / deploy from — lets several flavours coexist |
+| `VM`      | `kali-lab-01` | VM / libvirt domain name and Terraform workspace |
 | `VERBOSE` | `false` | Run Ansible with `-vvvv` |
 | `VARIANT` | `installer` | ISO flavour (`installer`, `installer-netinst`, `installer-everything`, `live`) |
+| `BROWSER` | `firefox-esr` | Browser launched by `make gui` |
 | `TF`      | `terraform` | IaC binary (`TF=tofu` to use OpenTofu) |
 | `POOL_DIR`| `/var/lib/libvirt/images` | libvirt default pool path |
 
 Example: `make bake GUI=true META=kali-linux-core VARIANT=installer-netinst`
+
+### GUI images and multiple flavours
+
+The GUI is decided at **bake** time, not at deploy — `deploy` just clones a golden.
+Use `GOLDEN=` to keep several named goldens in the pool and pick one per VM:
+
+```bash
+# a headless golden and a desktop golden, side by side
+make bake             GOLDEN=kali-headless && make install GOLDEN=kali-headless
+make bake DESKTOP=true GOLDEN=kali-desktop  && make install GOLDEN=kali-desktop
+
+# deploy different VMs from different goldens
+make deploy VM=attacker GOLDEN=kali-headless      # CLI only
+make deploy VM=desktop  GOLDEN=kali-desktop       # full XFCE
+virt-viewer -c qemu:///system desktop             # see the desktop (SPICE)
+```
+
+`DESKTOP=true` bakes a full XFCE desktop (shown by SPICE/`virt-viewer`); `GUI=true`
+bakes only the lightweight VNC stack for remote single-window use. They are
+independent. For an occasional GUI app without either, `make gui` uses SSH X11
+forwarding against a headless image.
+
+### Multiple VMs
+
+Each `deploy`/`destroy` uses a **Terraform workspace named after `VM=`**, so many
+VMs coexist, each in its own state, all backed by the (shared, read-only) golden.
+`virsh` sees every domain regardless of how it was created; the `ssh`/`gui`/
+`status`/`start`/`stop` targets target any of them by `VM=`.
 
 ---
 

@@ -22,10 +22,11 @@ SHELL := /bin/bash
 # spaces before the `#` into the value.
 META       ?= kali-linux-headless
 GUI        ?= false
+DESKTOP    ?= false
 VERBOSE    ?= false
 VARIANT    ?= installer
 POOL_DIR   ?= /var/lib/libvirt/images
-IMAGE_NAME ?= kali-golden.qcow2
+GOLDEN     ?= kali-golden
 SSH_USER   ?= kali
 BROWSER    ?= firefox-esr
 VM         ?= kali-lab-01
@@ -43,10 +44,17 @@ export PATH := $(BIN_DIR):$(PATH)
 # each recipe line runs in its own shell, so activation must chain with `&&`.
 ACTIVATE = if [ -f $(VENV)/bin/activate ]; then . $(VENV)/bin/activate; elif [ -f ../$(VENV)/bin/activate ]; then . ../$(VENV)/bin/activate; else echo "[!] Aucun venv trouve - lance 'make venv'"; exit 1; fi
 
+# Resolve the VM's CURRENT IP live: qemu-guest-agent first, then DHCP lease, then
+# the (possibly stale) Terraform output. One line so it works inside a recipe.
+LIVE_IP = ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null | awk '/ipv4/{split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(VM) --source lease 2>/dev/null | awk '/ipv4/{split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip 2>/dev/null)
+
 BUILD_DIR   := build
 DEPLOY_DIR  := deploy
-GOLDEN_SRC  := $(BUILD_DIR)/output-kali/$(IMAGE_NAME)
-GOLDEN_DST  := $(POOL_DIR)/$(IMAGE_NAME)
+# Packer always writes this fixed file; the flavour (headless/desktop) is chosen
+# at bake via DESKTOP=. `install` copies it into the pool under $(GOLDEN).qcow2,
+# so several named goldens can coexist and `deploy GOLDEN=` picks which to clone.
+PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
+GOLDEN_DST  := $(POOL_DIR)/$(GOLDEN).qcow2
 
 .PHONY: help check tools ensure-terraform venv iso bake install deploy ip ssh gui smoke all start stop reboot restart status autostart destroy clean validate
 
@@ -54,7 +62,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Vars: META=$(META)  GUI=$(GUI)  VARIANT=$(VARIANT)  TF=$(TF)"
+	@echo "Vars: META=$(META)  DESKTOP=$(DESKTOP)  GUI=$(GUI)  GOLDEN=$(GOLDEN)  VM=$(VM)  VARIANT=$(VARIANT)  TF=$(TF)"
 
 check: ## Test the toolchain (packer, terraform, ansible venv, KVM/libvirt)
 	@echo "== Environnement =="
@@ -124,40 +132,43 @@ iso: ## Resolve the latest Kali ISO into build/iso.auto.pkrvars.hcl (VARIANT=)
 
 bake: iso ## Fetch latest ISO, then build the golden qcow2 (META=, GUI=, VARIANT=)
 	@$(ACTIVATE) && cd $(BUILD_DIR) && packer init kali.pkr.hcl && \
-	  PACKER_LOG=1 packer build \
+	  PACKER_LOG=1 packer build -force \
 	    -var 'metapackage=$(META)' \
 	    -var 'enable_gui_vnc=$(GUI)' \
+	    -var 'enable_desktop=$(DESKTOP)' \
 	    -var 'ansible_verbose=$(VERBOSE)' .
 
-install: ## Copy the baked image into the libvirt pool (needs sudo)
-	@test -f $(GOLDEN_SRC) || { echo "!! $(GOLDEN_SRC) introuvable — lance 'make bake' d'abord"; exit 1; }
-	sudo cp $(GOLDEN_SRC) $(GOLDEN_DST)
+install: ## Copy the baked image into the pool as $(GOLDEN).qcow2 (needs sudo)
+	@test -f $(PACKER_OUT) || { echo "!! $(PACKER_OUT) introuvable — lance 'make bake' d'abord"; exit 1; }
+	sudo cp $(PACKER_OUT) $(GOLDEN_DST)
 	sudo chown libvirt-qemu:libvirt-qemu $(GOLDEN_DST)
 	-@virsh -c qemu:///system pool-refresh default >/dev/null 2>&1
 	@echo ">> Installé : $(GOLDEN_DST)"
 
-deploy: ensure-terraform ## terraform apply (deploy one VM from the image)
+deploy: ensure-terraform ## Deploy a VM (VM=<name> → its own Terraform workspace)
 	@test -f $(GOLDEN_DST) || sudo test -f $(GOLDEN_DST) \
 	  || { echo "[!] image dorée absente du pool ($(GOLDEN_DST)) — lance 'make install' (après 'make bake')"; exit 1; }
-	# -upgrade so a changed provider constraint re-selects (e.g. pinning libvirt 0.8.x
-	# over a previously-locked 0.9.x); stays within the constraint afterwards.
-	cd $(DEPLOY_DIR) && $(TF) init -upgrade && $(TF) apply -auto-approve
+	# One Terraform workspace per VM so several VMs coexist, each in its own state.
+	# -upgrade re-selects the provider if the constraint changed (libvirt 0.8.x pin).
+	cd $(DEPLOY_DIR) && $(TF) init -upgrade && \
+	  { $(TF) workspace select $(VM) 2>/dev/null || $(TF) workspace new $(VM); } && \
+	  $(TF) apply -auto-approve -var 'vm_name=$(VM)' -var 'golden_volume=$(GOLDEN).qcow2'
 
-ip: ## Print the VM's leased IP
-	@cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip
+ip: ## Print the VM's current IP (guest agent → lease → TF output)
+	@$(LIVE_IP); echo "$$ip"
 
 ssh: ## Open an interactive SSH session to the VM
-	@ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip); \
+	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — VM démarrée et bootée ? 'make status'"; exit 1; }; \
 	  echo ">> ssh $(SSH_USER)@$$ip"; \
 	  ssh -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip
 
 gui: ## Launch a browser on the VM over SSH X11 forwarding (BROWSER=)
-	@ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip); \
+	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \
 	  echo ">> $(BROWSER) via X11 on $(SSH_USER)@$$ip (window opens on your screen)"; \
 	  ssh -Y -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $(BROWSER)
 
 smoke: ## Non-interactive connectivity + identity check
-	@ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip); \
+	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \
 	  echo ">> Smoke-testing $(SSH_USER)@$$ip"; \
 	  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
 	      $(SSH_USER)@$$ip 'echo "OK: $$(hostname) — $$(grep PRETTY_NAME /etc/os-release | cut -d= -f2)"'
@@ -180,13 +191,16 @@ restart: ## Force power-cycle (destroy then start)
 
 status: ## Show VM state and current IP
 	@virsh -c qemu:///system list --all | grep -E "$(VM)|Nom|Name" || true
-	@virsh -c qemu:///system domifaddr $(VM) 2>/dev/null || true
+	@echo "-- guest agent --"; virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null || true
+	@echo "-- dhcp leases --"; virsh -c qemu:///system net-dhcp-leases default 2>/dev/null || true
 
 autostart: ## Start the VM automatically at host boot
 	virsh -c qemu:///system autostart $(VM)
 
-destroy: ensure-terraform ## terraform destroy
-	cd $(DEPLOY_DIR) && $(TF) destroy -auto-approve
+destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
+	cd $(DEPLOY_DIR) && { $(TF) workspace select $(VM) 2>/dev/null \
+	  && $(TF) destroy -auto-approve -var 'vm_name=$(VM)'; } \
+	  || echo "[!] pas de workspace Terraform '$(VM)' (rien à détruire côté TF)"
 
 clean: ## Remove local Packer build artifacts (keeps the pool image)
 	rm -rf $(BUILD_DIR)/output-kali $(BUILD_DIR)/manifest.json $(BUILD_DIR)/packer_cache
