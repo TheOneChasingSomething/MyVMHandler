@@ -5,8 +5,16 @@ users:
   - name: kali
     groups: [sudo]
     shell: /bin/bash
+    lock_passwd: false          # cloud-init locks passwords by default; keep console login working
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - ${ssh_pubkey}
+# Set the console password (SSH still uses the key above). Lab credentials only.
+chpasswd:
+  expire: false
+  users:
+    - name: kali
+      password: kali
+      type: text
 ssh_pwauth: true
 package_update: false

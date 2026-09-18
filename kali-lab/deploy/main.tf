@@ -28,7 +28,9 @@ resource "libvirt_volume" "kali_disk" {
   size             = var.disk_gb * 1024 * 1024 * 1024
 }
 
-# NoCloud seed disk: hostname + SSH key for this VM
+# NoCloud seed disk: hostname + SSH key + DHCP network config for this VM.
+# network_config makes cloud-init bring eth0 up via DHCP at first boot,
+# regardless of what interface name the baked image configured at install time.
 resource "libvirt_cloudinit_disk" "kali_init" {
   name = "${var.vm_name}-cloudinit.iso"
   pool = var.pool
@@ -36,6 +38,12 @@ resource "libvirt_cloudinit_disk" "kali_init" {
     hostname   = var.vm_name
     ssh_pubkey = trimspace(file(pathexpand(var.ssh_public_key_path)))
   })
+  network_config = <<-EOT
+    version: 2
+    ethernets:
+      eth0:
+        dhcp4: true
+  EOT
 }
 
 resource "libvirt_domain" "kali" {

@@ -1,0 +1,64 @@
+# --- Terraform ---
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+.terraform/
+terraform.tfvars
+*.auto.tfvars
+*.tftest.hcl
+# Exclure les binaires téléchargés manuellement
+bin/
+.bin/
+*terraform*
+*tfe*
+*packer*
+*ansible*
+
+# --- Packer ---
+.packer/
+*.pkr.hcl
+*.pkrvars.hcl
+packer_cache/
+*.iso
+*.vmdk
+*.qcow2
+*.ami
+*.json
+!*.pkr.hcl  # Gardez vos templates, mais pas les builds finis
+builds/
+output-*
+
+# --- Ansible ---
+.ansible/
+inventory/*.ini
+inventory/*.yaml
+vault_password
+*.vault
+*.log
+roles/*/files/*
+!roles/*/files/.gitkeep
+site.yml
+playbooks/*.yml
+!playbooks/.gitkeep
+*.retry
+*.bak
+
+# --- Général / OS ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.local
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
