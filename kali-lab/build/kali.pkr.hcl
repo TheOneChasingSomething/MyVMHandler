@@ -56,6 +56,33 @@ variable "ansible_verbose" {
   default     = false
 }
 
+variable "keyboard_layout" {
+  type        = string
+  description = "Console + X11 keyboard layout baked into the image (e.g. fr, us)"
+  default     = "fr"
+}
+
+variable "full_upgrade" {
+  type        = bool
+  description = "Run a full apt upgrade at bake time (patches the rolling release; slower)"
+  default     = false
+}
+
+variable "resolution" {
+  type        = string
+  description = "Fixed desktop resolution baked as a session autostart (e.g. 1680x1050); empty = dynamic auto-resize"
+  default     = ""
+}
+
+# Short commit of the pipeline repo, recorded in the build manifest so a golden
+# image is traceable to the exact source that produced it. `make bake` fills it
+# with `git rev-parse --short HEAD`; defaults to "unknown" outside a repo.
+variable "pipeline_commit" {
+  type        = string
+  description = "Pipeline git commit recorded in /etc/kali-lab-build.json"
+  default     = "unknown"
+}
+
 variable "disk_size" {
   type    = string
   default = "20480" # MiB
@@ -139,8 +166,20 @@ build {
     ansible_env_vars = ["ANSIBLE_CALLBACKS_ENABLED=profile_tasks"]
     extra_arguments = concat(
       ["--extra-vars", "kali_metapackage=${var.metapackage} enable_gui_vnc=${var.enable_gui_vnc} enable_desktop=${var.enable_desktop}"],
+      # Provenance fields folded into /etc/kali-lab-build.json by the playbook.
+      ["--extra-vars", "manifest_iso_url=${var.iso_url} manifest_iso_sha=${var.iso_checksum} manifest_pipeline_commit=${var.pipeline_commit}"],
+      ["--extra-vars", "keyboard_layout=${var.keyboard_layout} full_upgrade=${var.full_upgrade}"],
+      ["--extra-vars", "resolution=${var.resolution}"],
       var.ansible_verbose ? ["-vvvv"] : []
     )
+  }
+
+  # Pull the guest-side manifest back to the host so provenance is available
+  # without booting a VM (Terraform reads it to set the domain <description>).
+  provisioner "file" {
+    source      = "/etc/kali-lab-build.json"
+    destination = "manifests/kali-golden.json"
+    direction   = "download"
   }
 
   post-processor "manifest" {

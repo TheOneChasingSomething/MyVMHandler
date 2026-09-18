@@ -2,6 +2,12 @@
 build/output-kali/
 build/manifest.json
 build/packer_cache/
+build/iso.auto.pkrvars.hcl
+
+# Provenance manifests + app-list backups (regenerated locally per build/VM)
+build/manifests/*.json
+build/apps/*.selections
+build/apps/*.manual
 
 # Terraform state and local config
 deploy/.terraform/
@@ -9,6 +15,12 @@ deploy/.terraform.lock.hcl
 deploy/terraform.tfstate
 deploy/terraform.tfstate.backup
 deploy/terraform.tfvars
+
+# Python venv (Ansible)
+venv/
+
+# Locally-installed tool binaries (Terraform auto-install)
+.bin/
 
 # Golden image
 *.qcow2

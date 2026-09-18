@@ -18,3 +18,24 @@ chpasswd:
       type: text
 ssh_pwauth: true
 package_update: false
+%{ if data_disk ~}
+# ---- Persistent data disk (attached by Terraform when DATA=true) ----
+# Format the extra virtio disk ONCE (overwrite:false keeps existing data on
+# redeploy) so /data survives `make destroy` + a redeploy onto a newer golden.
+fs_setup:
+  - label: labdata
+    filesystem: ext4
+    device: /dev/vdb
+    overwrite: false
+%{ endif ~}
+%{ if data_disk || share ~}
+# One mounts: block only (cloud-init forbids duplicate keys). nofail = boot even
+# if a mount source is missing; /data is mounted by LABEL (device-order-proof).
+mounts:
+%{ if data_disk ~}
+  - [ "LABEL=labdata", /data, ext4, "defaults,nofail,x-systemd.device-timeout=5s", "0", "2" ]
+%{ endif ~}
+%{ if share ~}
+  - [ "${share_tag}", /mnt/host, virtiofs, "defaults,nofail", "0", "0" ]
+%{ endif ~}
+%{ endif ~}

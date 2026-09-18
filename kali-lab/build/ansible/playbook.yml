@@ -7,6 +7,8 @@
     full_upgrade: false      # set true to patch fully at bake time (slower)
     enable_gui_vnc: false    # set true (or -e / Packer var) to bake the VNC stack
     enable_desktop: false    # set true to bake a full XFCE desktop (SPICE/virt-viewer)
+    keyboard_layout: fr      # console + X11 keyboard layout (override with -e / KBD=)
+    resolution: ""           # fixed display mode e.g. 1680x1050 ("" = dynamic auto-resize)
 
   tasks:
     - name: Update apt cache
@@ -30,6 +32,21 @@
       ansible.builtin.apt:
         name: "{{ kali_metapackage }}"
         state: present
+
+    # /etc/default/keyboard is read by console-setup (tty) and by the X server
+    # (desktop) at boot, so this one file sets the layout for both. Applies on
+    # the next boot of each deployed clone.
+    - name: Set the console + X11 keyboard layout
+      ansible.builtin.copy:
+        dest: /etc/default/keyboard
+        mode: "0644"
+        content: |
+          # Managed by the kali-lab bake (keyboard_layout var)
+          XKBMODEL="pc105"
+          XKBLAYOUT="{{ keyboard_layout | default('fr') }}"
+          XKBVARIANT=""
+          XKBOPTIONS=""
+          BACKSPACE="guess"
 
     # ---- Remote GUI access (see runbook §6) ----
     # No restart/notify here on purpose: the generalization tasks below delete
@@ -65,11 +82,14 @@
         name:
           - kali-desktop-xfce   # full Kali XFCE desktop
           - lightdm             # display manager (graphical login)
-          - spice-vdagent       # SPICE integration (clipboard, resolution)
+          - spice-vdagent       # SPICE integration (clipboard + dynamic resize)
         state: present
       when: enable_desktop | default(false) | bool
+      # NB: no X video driver package here — the domain uses virtio-gpu (see
+      # deploy/spice.xsl), whose driver is in-kernel (virtio_gpu). The legacy
+      # xserver-xorg-video-qxl has been dropped from Kali rolling.
 
-    - name: Boot to the graphical target and enable lightdm (optional)
+    - name: Boot to the graphical target and enable services (optional)
       when: enable_desktop | default(false) | bool
       block:
         - name: Default to graphical.target
@@ -79,6 +99,41 @@
           ansible.builtin.systemd:
             name: lightdm
             enabled: true
+        - name: Enable the SPICE vdagent daemon (clipboard + resize)
+          ansible.builtin.systemd:
+            name: spice-vdagentd
+            enabled: true
+
+    # ---- Optional fixed display resolution (RES=, e.g. 1680x1050) ----
+    # Drops a session-start autostart that pins the mode. Auto-detects the output
+    # so it works whatever the connector is named. NB: uncheck virt-viewer's
+    # "Automatically resize" for a fixed mode to stick (vdagent otherwise follows
+    # the window). Empty resolution => nothing installed (dynamic behaviour kept).
+    - name: Install a fixed-resolution autostart (optional)
+      when:
+        - enable_desktop | default(false) | bool
+        - (resolution | default('') | length) > 0
+      block:
+        - name: Install the resolution helper script
+          ansible.builtin.copy:
+            dest: /usr/local/bin/lab-resolution.sh
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              # Apply a fixed display mode at session start (kali-lab RES bake).
+              OUT=$(xrandr | awk '/ connected/{print $1; exit}')
+              [ -n "$OUT" ] && xrandr --output "$OUT" --mode "{{ resolution }}"
+        - name: Autostart the helper for all desktop sessions
+          ansible.builtin.copy:
+            dest: /etc/xdg/autostart/lab-resolution.desktop
+            mode: "0644"
+            content: |
+              [Desktop Entry]
+              Type=Application
+              Name=Lab fixed resolution
+              Exec=/usr/local/bin/lab-resolution.sh
+              X-GNOME-Autostart-enabled=true
+              NoDisplay=true
 
     - name: Enable core services
       ansible.builtin.systemd:
@@ -87,6 +142,57 @@
       loop:
         - ssh
         - qemu-guest-agent
+
+    # ---- Build manifest / provenance (see runbook §8) ----
+    # Record what this golden image actually is — OS version, kernel, how far
+    # behind on updates it was at bake time, the source ISO + its SHA-256, and
+    # the pipeline commit — so a deployed VM can always be traced back to the
+    # exact image it came from. Packer downloads this file to the host after the
+    # build (build/manifests/), and Terraform reads it to set the domain
+    # <description>. `manifest_*` and `pipeline_commit` are passed as extra-vars
+    # by Packer; the defaults let a bare `ansible-playbook` run still succeed.
+    - name: Count packages still upgradable (update level)
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null | grep -c '^Inst' || true
+      args:
+        executable: /bin/bash
+      register: kalilab_upg
+      changed_when: false
+
+    - name: Read the OS PRETTY_NAME
+      ansible.builtin.shell: . /etc/os-release && printf '%s' "$PRETTY_NAME"
+      register: kalilab_pn
+      changed_when: false
+
+    - name: Expose the two captured values as facts
+      ansible.builtin.set_fact:
+        kalilab_upgradable: "{{ kalilab_upg.stdout | trim | int }}"
+        kalilab_pretty_name: "{{ kalilab_pn.stdout | trim }}"
+
+    - name: Write the build manifest to /etc/kali-lab-build.json
+      ansible.builtin.template:
+        src: kali-lab-build.json.j2
+        dest: /etc/kali-lab-build.json
+        mode: "0644"
+
+    # ---- virtiofs host<->guest share (mounted on /mnt/host when SHARE= is set) ----
+    # cloud-init's mounts module is unreliable for virtiofs (module not yet loaded
+    # at first `mount -a`, mountpoint not created). Bake the two prerequisites so
+    # the fstab entry cloud-init writes just works: autoload the module at boot and
+    # pre-create the mountpoint. Harmless on VMs deployed without a share (the
+    # fstab line uses nofail, so a missing 'hostshare' tag is skipped at boot).
+    - name: Autoload the virtiofs kernel module at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/virtiofs.conf
+        content: "virtiofs\n"
+        mode: "0644"
+
+    - name: Pre-create the shared-folder mountpoint
+      ansible.builtin.file:
+        path: /mnt/host
+        state: directory
+        mode: "0755"
 
     - name: Pin cloud-init to the NoCloud datasource (Terraform injects config)
       ansible.builtin.copy:

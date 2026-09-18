@@ -46,11 +46,15 @@ kali-lab/
 │   ├── kali.pkr.hcl            #   Packer template (qemu builder + ansible provisioner)
 │   ├── fetch-latest-iso.sh     #   resolve the current Kali ISO name + sha256
 │   ├── http/preseed.cfg        #   unattended Kali installer answer file
-│   └── ansible/playbook.yml    #   install metapackage + GUI bits, then generalize
+│   ├── ansible/playbook.yml    #   install metapackage + GUI bits, write manifest, generalize
+│   ├── ansible/templates/      #   kali-lab-build.json.j2 — the build manifest
+│   ├── manifests/              #   per-golden provenance JSON (downloaded after bake)
+│   └── apps/                   #   per-VM package-selection backups (apps-save)
 └── deploy/                     # STAGE 2 — deploy a VM from the image
-    ├── main.tf
+    ├── main.tf                 #   volume + cloud-init + domain (+ data disk, description)
     ├── variables.tf
     ├── outputs.tf
+    ├── spice.xsl               #   XSLT: QXL video + SPICE vdagent channel
     ├── cloud_init.yaml.tftpl
     └── terraform.tfvars.example
 ```
@@ -90,6 +94,10 @@ make destroy      # tear the VM down
 | `deploy` | Deploy `VM=<name>` from `GOLDEN=<name>` in its own Terraform workspace |
 | `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a browser over X11 / non-interactive check |
 | `start` / `stop` / `reboot` / `restart` / `status` / `autostart` | VM lifecycle via `virsh` (all honour `VM=`) |
+| `snapshot` / `snapshots` / `revert` / `snapshot-delete` | Point-in-time snapshots (`SNAP=`, default `clean`) |
+| `data-create` / `data-delete` | Create / delete the persistent `/data` image `$(VM)-data.raw` (`DATA_GB=`) |
+| `apps-save` / `apps-restore` | Export / re-install the VM's package selection (survives a destroy+rebuild) |
+| `info` / `provenance` | Show a VM's provenance: libvirt description + live `/etc/kali-lab-build.json` |
 | `all`    | `bake → install → deploy → smoke` |
 | `destroy` / `clean` | Destroy `VM=<name>` (its workspace) / remove local build artifacts |
 
@@ -110,6 +118,15 @@ they work on any deployed domain (not just the last one).
 | `BROWSER` | `firefox-esr` | Browser launched by `make gui` |
 | `TF`      | `terraform` | IaC binary (`TF=tofu` to use OpenTofu) |
 | `POOL`    | `default` | libvirt storage pool name |
+| `SPICE`   | `true` | Apply the virtio/SPICE XSLT (virtio-gpu, clipboard/resize, virtiofs); needs `xsltproc`. `SPICE=false` for headless VMs |
+| `KBD`     | `fr` | Console + X11 keyboard layout baked into the golden |
+| `UPGRADE` | `true` | Run a full `apt upgrade` at bake time (patches the rolling release) |
+| `SHARE`   | `$(CURDIR)/shared` | Host dir shared into the guest over virtiofs at `/mnt/host`. `SHARE=` (empty) disables it |
+| `SHARE_TAG` | `hostshare` | virtiofs mount tag |
+| `DATA`    | `false` | `deploy DATA=true` attaches the persistent data disk on `/data` |
+| `DATA_GB` | `10` | Size of the data image created by `make data-create` |
+| `SRC`     | `$(VM)` | Source VM whose saved package list `apps-restore` re-installs |
+| `MEM` / `VCPU` / `DISK` | `4096` / `2` / `30` | RAM (MiB), vCPUs, root disk (GiB) for `deploy` |
 
 Example: `make bake GUI=true META=kali-linux-core VARIANT=installer-netinst`
 
@@ -149,7 +166,7 @@ VMs coexist, each in its own state, all backed by the (shared, read-only) golden
 sudo apt update
 sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
                     virtinst bridge-utils genisoimage cpu-checker \
-                    python3-venv unzip curl
+                    python3-venv unzip curl xsltproc
 kvm-ok                                    # confirm hardware virtualization
 sudo usermod -aG libvirt,kvm "$USER"      # then log out / back in
 sudo virsh net-start default   ; sudo virsh net-autostart default
@@ -230,6 +247,96 @@ See §6 of the runbook for noVNC, xrdp/XFCE, and the SPICE console.
 
 ---
 
+## Provenance and persistence
+
+Two related needs when you rebuild lab VMs onto a newer Kali: **know exactly what
+an image is**, and **keep the data/apps that must outlive a rebuild**.
+
+### Build manifest (what OS + patch level is this?)
+
+Every bake writes `/etc/kali-lab-build.json` inside the golden, recording the OS
+distribution/version, kernel, how many packages were still upgradable at bake time
+(the *update level*), whether a full upgrade was applied, the source ISO + its
+SHA-256, the flavour (metapackage + desktop/VNC flags), the build date, and the
+pipeline git commit. Packer then downloads the file to `build/manifests/`, and
+Terraform folds a one-line summary into the libvirt domain `<description>` at
+deploy time. Read it back any time:
+
+```bash
+make info VM=attacker          # libvirt description + live guest manifest (pretty JSON)
+virsh -c qemu:///system desc attacker
+ssh kali@<vm-ip> cat /etc/kali-lab-build.json
+```
+
+The manifest travels *with the image*, so a VM cloned from a golden months ago
+still tells you precisely which build it came from.
+
+### Persistent data disk (`DATA=true`)
+
+A VM's root disk is a disposable copy-on-write overlay — `make destroy` deletes it.
+To keep files across a destroy + rebuild (e.g. moving to a newer Kali), attach a
+**separate data disk** that Terraform does *not* own:
+
+```bash
+make data-create VM=attacker DATA_GB=20     # once — creates attacker-data.raw in the pool
+make deploy      VM=attacker DATA=true       # attaches it; cloud-init mounts it on /data
+# ... work, save everything under /data ...
+make destroy     VM=attacker                 # removes the domain + root overlay ONLY
+make bake ... && make install GOLDEN=...      # newer golden
+make deploy      VM=attacker DATA=true GOLDEN=<newer>   # /data comes back intact
+```
+
+Why it survives: the image is a standalone raw volume created out-of-band by
+`data-create`, attached *by path*. Terraform manages only the domain and the root
+overlay, so `destroy` never touches it. cloud-init formats it **once**
+(`overwrite: false`) and mounts it by filesystem **label** (`LABEL=labdata`, with
+`nofail`), so device ordering and an absent disk are both handled. Delete it
+explicitly — and lose its contents — with `make data-delete VM=attacker`.
+
+> Attach/detach happens through the Terraform apply that `make deploy` runs, so
+> change the data disk via destroy+deploy rather than re-`apply`-ing a live VM.
+
+### Shared folder vs data disk
+
+Two different mechanisms, often confused:
+
+- **`/data` (data disk, `DATA=true`)** — a virtual **disk that belongs to the VM**
+  (ext4 on `<vm>-data.raw`). It persists across destroy/rebuild but the host does
+  not mount its contents. Use it for state that must live *inside* the VM.
+- **`/mnt/host` (virtiofs, `SHARE=`)** — a **host directory mounted live inside the
+  guest**, like VirtualBox shared folders. Files written on either side appear on
+  the other immediately. Use it to exchange files with the host.
+
+virtiofs is on by default (`SHARE=$(CURDIR)/shared`, created automatically). It
+needs `SPICE=true` (the XSLT injects the `virtiofs` driver and the shared-memory
+backing the guest requires) and a working `virtiofsd` on the host (shipped with
+modern libvirt/QEMU). Disable it with `SHARE=` (empty), or point it elsewhere:
+
+```bash
+make deploy VM=poste GOLDEN=kali-desktop SHARE=/srv/labfiles   # share a specific dir
+make deploy VM=poste GOLDEN=kali-desktop SHARE=                 # no share
+# in the guest: files under /mnt/host are the host's SHARE directory, live
+```
+
+### Application backup (`apps-save` / `apps-restore`)
+
+`/data` keeps files, not the set of installed packages. To carry the **installed
+applications** across a rebuild, snapshot the package selection and replay it:
+
+```bash
+make apps-save    VM=attacker                 # → build/apps/attacker.{selections,manual}
+# ... destroy, redeploy onto a newer golden ...
+make apps-restore VM=attacker SRC=attacker     # apt-mark showmanual → apt-get install
+```
+
+`apps-save` records both the full `dpkg --get-selections` and the explicit
+(`apt-mark showmanual`) list; `apps-restore` re-installs the explicit list with
+`apt-get`, which resolves current versions on the new base — more robust across a
+rolling-release bump than pinning exact versions. Combine the three: manifest for
+*what it is*, data disk for *files*, app backup for *installed tools*.
+
+---
+
 ## Troubleshooting
 
 Lessons learned building this pipeline — each is a common Kali/Packer/libvirt gotcha.
@@ -271,6 +378,19 @@ Lessons learned building this pipeline — each is a common Kali/Packer/libvirt 
   failed `apply` defined the domain in libvirt but Terraform did not record it
   (state drift). Remove the orphan with `virsh -c qemu:///system undefine <vm>`
   (add `--nvram` if asked), then `make deploy`.
+- **Deploy fails: `error applying XSLT stylesheet: exec: "xsltproc": executable file not found`** —
+  the SPICE integration (`deploy/spice.xsl`, applied via `xml { xslt }`) is applied
+  by the provider by shelling out to `xsltproc`, which is not installed. Either
+  `sudo apt install -y xsltproc` (needed for the desktop clipboard/resize), or skip
+  the block for headless VMs with `make deploy … SPICE=false`. The root overlay and
+  cloud-init disk are created before the domain, so a re-run only creates the domain
+  — no cleanup needed.
+- **Deploy fails or the share won't mount with `SHARE=`** — virtiofs needs (1)
+  `SPICE=true` so the XSLT injects the `virtiofs` driver + shared-memory backing
+  (`make deploy` refuses `SHARE=` with `SPICE=false`), and (2) a `virtiofsd`
+  binary on the host (from the `qemu-system` / libvirt packages). Check the guest
+  with `mount | grep /mnt/host` and `dmesg | grep -i virtiofs`; disable the share
+  with `SHARE=` if not needed.
 - **Disk full** — Packer caches the ISO in `~/.cache/packer` and never deletes it.
   Clear with `rm -rf ~/.cache/packer/*`, or set `PACKER_CACHE_DIR` to another disk.
 
@@ -294,3 +414,6 @@ Lessons learned building this pipeline — each is a common Kali/Packer/libvirt 
 - Debian preseeding — <https://www.debian.org/releases/stable/amd64/apb.html>
 - Kali metapackages — <https://www.kali.org/docs/general-use/metapackages/>
 - cloud-init NoCloud datasource — <https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html>
+- cloud-init disk setup / mounts — <https://cloudinit.readthedocs.io/en/latest/reference/modules.html#disk-setup>
+- `dpkg` selections & `apt-mark` — <https://manpages.debian.org/bookworm/dpkg/dpkg.1.en.html> · <https://manpages.debian.org/bookworm/apt/apt-mark.8.en.html>
+- libvirt domain XML (disks, description) — <https://libvirt.org/formatdomain.html>
