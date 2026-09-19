@@ -1,0 +1,53 @@
+# Research profile — dev tools applied to a running VM by:
+#   make provision VM=<vm> PROFILE=research
+# Edit freely and add your own profiles as provision/profiles/<name>.yml.
+
+# Packages from the Kali/Debian repositories.
+apt_packages:
+  - awscli          # AWS CLI
+  - git
+  - python3-pip
+  - wireshark
+  - tmux
+  - jq
+  - openjdk-21-jdk  # required by Ghidra 11.x (uncomment the download below)
+
+# External signed apt repositories.
+apt_repos:
+  - name: vscode
+    key_url: https://packages.microsoft.com/keys/microsoft.asc
+    keyring: /etc/apt/keyrings/microsoft.gpg
+    repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
+    packages:
+      - code
+
+# ---- Ghidra (off-repo download) ------------------------------------------
+# Fetched and extracted into /opt. Bump the version/URL from the releases page:
+# https://github.com/NationalSecurityAgency/ghidra/releases
+# Needs a JDK (openjdk-21-jdk above). Run it with /opt/ghidra_*/ghidraRun.
+# Uncomment to enable:
+# downloads:
+#   - name: ghidra
+#     url: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
+#     dest: /opt
+#     unarchive: true
+# run_commands:                       # PATH symlink so `make gui BINARY=ghidra` works
+#   - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
+#     become: true
+
+# ---- DNS resolvers -------------------------------------------------------
+# Overwrites /etc/resolv.conf. Uncomment to enable:
+# dns:
+#   - 1.1.1.1
+#   - 9.9.9.9
+
+# ---- OpenVPN client (+ optional fail-closed killswitch) ------------------
+# Copies a .ovpn from an ABSOLUTE host path into the VM and enables the client
+# service. vpn_killswitch: true adds an nftables fail-closed firewall so that if
+# the tunnel drops, only the LAN stays reachable and the public IP never leaks.
+# Uncomment and point 'config' at your file:
+# openvpn:
+#   config: /home/me/vpn/lab.ovpn
+#   autostart: true
+# vpn_killswitch: true
+# lan_cidr: "192.168.122.0/24"   # LAN kept open for SSH management (default)

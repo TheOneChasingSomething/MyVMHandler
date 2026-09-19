@@ -38,6 +38,7 @@ POOL       ?= default
 GOLDEN     ?= kali-golden
 SSH_USER   ?= kali
 BROWSER    ?= firefox-esr
+BINARY     ?=
 VM         ?= kali-lab-01
 SNAP       ?= clean
 MEM        ?= 4096
@@ -50,7 +51,7 @@ SPICE      ?= true
 SHARE      ?= $(CURDIR)/shared
 SHARE_TAG  ?= hostshare
 SWAP       ?= 2G
-PROFILE    ?= recherche
+PROFILE    ?= research
 IMG        ?= $(GOLDEN).qcow2
 OUT        ?= $(CURDIR)/export
 MAXSIZE    ?=
@@ -251,10 +252,11 @@ ssh: ## Open an interactive SSH session to the VM
 	  echo ">> ssh $(SSH_USER)@$$ip"; \
 	  ssh -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip
 
-gui: ## Launch a browser on the VM over SSH X11 forwarding (BROWSER=)
+gui: ## Launch a GUI app on the VM over SSH X11 (BINARY=<cmd>, default BROWSER)
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \
-	  echo ">> $(BROWSER) via X11 on $(SSH_USER)@$$ip (window opens on your screen)"; \
-	  ssh -Y -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $(BROWSER)
+	  app="$(BINARY)"; [ -n "$$app" ] || app="$(BROWSER)"; \
+	  echo ">> $$app via X11 on $(SSH_USER)@$$ip (window opens on your screen)"; \
+	  ssh -Y -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $$app
 
 smoke: ## Non-interactive connectivity + identity check
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \

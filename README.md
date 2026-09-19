@@ -60,7 +60,7 @@ kali-lab/
 provision/                     # POST-DEPLOY — layer tools/config onto a running VM
 ├── site.yml                   #   Ansible play (apt, repos, downloads, docker, run_commands…)
 └── profiles/                  #   one YAML per lab profile
-    ├── recherche.yml          #     dev + VS Code
+    ├── research.yml          #     dev + VS Code
     ├── v8.yml                 #     build the V8 engine on /data
     ├── pentest.yml            #     offensive toolkit
     └── cibles.yml             #     vulnerable web targets (Docker)
@@ -100,7 +100,7 @@ make destroy      # tear the VM down
 | `install`| Copy the baked image into the pool as `$(GOLDEN).qcow2` and refresh it |
 | `deploy` | Deploy `VM=<name>` from `GOLDEN=<name>` in its own Terraform workspace |
 | `provision`| Apply a lab profile (`PROFILE=`) to a running VM over SSH — installs tools/repos |
-| `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a browser over X11 / non-interactive check |
+| `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a GUI app over X11 (`BINARY=`, default `BROWSER`) / non-interactive check |
 | `start` / `stop` / `reboot` / `restart` / `status` / `autostart` | VM lifecycle via `virsh` (all honour `VM=`) |
 | `snapshot` / `snapshots` / `revert` / `snapshot-delete` | Point-in-time snapshots (`SNAP=`, default `clean`) |
 | `data-create` / `data-delete` | Create / delete the persistent `/data` image `$(VM)-data.raw` (`DATA_GB=`) |
@@ -134,7 +134,7 @@ they work on any deployed domain (not just the last one).
 | `SHARE`   | `$(CURDIR)/shared` | Host dir shared into the guest over virtiofs at `/mnt/host`. `SHARE=` (empty) disables it |
 | `SHARE_TAG` | `hostshare` | virtiofs mount tag |
 | `SWAP`    | `2G` | cloud-init swap file size on first boot (no swap partition); `SWAP=` disables |
-| `PROFILE` | `recherche` | Lab profile (`provision/profiles/<name>.yml`) applied by `make provision` |
+| `PROFILE` | `research` | Lab profile (`provision/profiles/<name>.yml`) applied by `make provision` |
 | `DATA`    | `false` | `deploy DATA=true` attaches the persistent data disk on `/data` |
 | `DATA_GB` | `10` | Size of the data image created by `make data-create` |
 | `SRC`     | `$(VM)` | Source VM whose saved package list `apps-restore` re-installs |
@@ -268,10 +268,10 @@ re-runnable, no rebake:
 
 ```bash
 make deploy    VM=poste GOLDEN=kali-desktop DATA=true
-make provision VM=poste PROFILE=recherche      # installs the profile's tools
+make provision VM=poste PROFILE=research      # installs the profile's tools
 ```
 
-A profile lists the packages and external repositories to set up. `provision/profiles/recherche.yml`:
+A profile lists the packages and external repositories to set up. `provision/profiles/research.yml`:
 
 ```yaml
 apt_packages: [ awscli, git, python3-pip, wireshark, tmux, jq ]
@@ -291,10 +291,12 @@ A profile can use any of these keys (all optional): `apt_packages`, `apt_repos`,
 `min_free_gb`/`min_free_path`, `directories`, `dns`, `host_binaries` (copied from
 the host — e.g. a proprietary IDA installer or analysis samples), `downloads`
 (fetched into the VM, optionally extracted — e.g. Ghidra), `git_repos`, `env_path`,
-`openvpn` (import a `.ovpn` and enable the client), `docker_run` (install Docker and
-run containers), and `run_commands` (build steps). `provision/site.yml` documents each.
+`openvpn` (import a `.ovpn` and enable the client), `vpn_killswitch` (fail-closed
+nftables firewall so a dropped tunnel never leaks the public IP), `docker_run`
+(install Docker and run containers), and `run_commands` (build steps).
+`provision/site.yml` documents each.
 
-Ready-made profiles: `recherche` (dev + VS Code), `v8` (build the V8 engine),
+Ready-made profiles: `research` (dev + VS Code), `v8` (build the V8 engine),
 `pentest` (offensive toolkit), `cibles` (vulnerable web targets in Docker — DVWA,
 WebGoat, Juice Shop). For a lab, deploy the attacker box and the targets as
 **separate VMs**:

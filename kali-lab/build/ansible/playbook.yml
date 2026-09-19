@@ -218,5 +218,6 @@
 
     - name: Clean apt caches
       ansible.builtin.apt:
+        clean: true        # empties /var/cache/apt/archives (the full-upgrade .debs)
         autoclean: true
         autoremove: true
