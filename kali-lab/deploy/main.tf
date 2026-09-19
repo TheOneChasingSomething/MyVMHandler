@@ -65,6 +65,7 @@ resource "libvirt_cloudinit_disk" "kali_init" {
     data_disk  = var.data_disk_path != ""
     share      = var.share_path != ""
     share_tag  = var.share_tag
+    swap_size  = var.swap_size
   })
   network_config = <<-EOT
     version: 2

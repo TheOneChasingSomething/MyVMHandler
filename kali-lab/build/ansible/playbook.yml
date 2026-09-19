@@ -20,12 +20,13 @@
         upgrade: full
       when: full_upgrade | bool
 
-    - name: Install cloud-init, guest agent, python
+    - name: Install cloud-init, guest agent, python, growpart
       ansible.builtin.apt:
         name:
           - cloud-init
           - qemu-guest-agent
           - python3
+          - cloud-guest-utils   # provides growpart so cloud-init grows / to DISK=
         state: present
 
     - name: Install the chosen Kali metapackage

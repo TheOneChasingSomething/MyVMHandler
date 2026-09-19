@@ -69,3 +69,9 @@ variable "share_tag" {
   description = "virtiofs mount tag the guest uses to mount the shared folder"
   default     = "hostshare"
 }
+
+variable "swap_size" {
+  type        = string
+  description = "cloud-init swap file size on first boot (e.g. 2G); empty = no swap. There is no swap partition (single-partition golden), so this provides swap."
+  default     = ""
+}

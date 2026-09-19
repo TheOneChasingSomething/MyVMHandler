@@ -18,6 +18,13 @@ chpasswd:
       type: text
 ssh_pwauth: true
 package_update: false
+%{ if swap_size != "" ~}
+# Swap file created on first boot (the golden has no swap partition, so root can
+# grow). Runs after resize_rootfs, so the space is already there.
+swap:
+  filename: /swapfile
+  size: ${swap_size}
+%{ endif ~}
 %{ if data_disk ~}
 # ---- Persistent data disk (attached by Terraform when DATA=true) ----
 # Format the extra virtio disk ONCE (overwrite:false keeps existing data on

@@ -1,0 +1,60 @@
+# V8 build profile — checks out and compiles V8 on the persistent /data disk.
+#
+# PREREQS (the /data disk must be >= 30 GiB and mounted):
+#   make data-create VM=v8 DATA_GB=30
+#   make deploy      VM=v8 GOLDEN=kali-desktop DATA=true
+#   make provision   VM=v8 PROFILE=v8            # this file (long: fetch + build)
+#
+# Everything lives under /data so it survives destroy/redeploy onto a newer golden.
+# depot_tools + gclient run as the SSH user (never root); install-build-deps needs
+# root and runs via sudo. Steps are guarded (creates:) so re-running resumes.
+
+# Fail fast if the data disk is too small for a V8 checkout + build.
+min_free_gb: 30
+min_free_path: /data
+
+# Base tools; depot_tools' install-build-deps.sh pulls the full toolchain.
+apt_packages:
+  - git
+  - curl
+  - python3
+  - python3-pip
+  - lsb-release
+  - xz-utils
+  - pkg-config
+
+# Give the SSH user ownership of the mounted data disk so it can check V8 out.
+directories:
+  - { path: /data, owner: kali, group: kali, mode: "0755" }
+
+# depot_tools provides fetch / gclient / gn / ninja wrappers.
+git_repos:
+  - repo: https://chromium.googlesource.com/chromium/tools/depot_tools.git
+    dest: /data/depot_tools
+    become: false
+
+# Make depot_tools available on PATH (login shells + the run_commands below).
+env_path:
+  - /data/depot_tools
+
+run_commands:
+  # 1) Fetch V8 (runs gclient sync with hooks). Long: several GiB.
+  - cmd: "fetch v8"
+    chdir: /data
+    creates: /data/v8/.git
+    become: false
+
+  # 2) Install build dependencies (needs root).
+  - cmd: "./build/install-build-deps.sh --no-prompt && touch /data/v8/.deps-installed"
+    chdir: /data/v8
+    creates: /data/v8/.deps-installed
+    become: true
+
+  # 3) Build the d8 shell in x64.release (gm.py drives gn + ninja). Long/CPU-heavy.
+  - cmd: "tools/dev/gm.py x64.release d8"
+    chdir: /data/v8
+    creates: /data/v8/out/x64.release/d8
+    become: false
+
+# After it finishes:  /data/v8/out/x64.release/d8 --version
+# Rebuild after edits:  cd /data/v8 && tools/dev/gm.py x64.release d8

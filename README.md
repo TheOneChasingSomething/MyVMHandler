@@ -54,9 +54,16 @@ kali-lab/
     ├── main.tf                 #   volume + cloud-init + domain (+ data disk, description)
     ├── variables.tf
     ├── outputs.tf
-    ├── spice.xsl               #   XSLT: QXL video + SPICE vdagent channel
+    ├── spice.xsl               #   XSLT: virtio-gpu + tablet + SPICE + virtiofs
     ├── cloud_init.yaml.tftpl
     └── terraform.tfvars.example
+provision/                     # POST-DEPLOY — layer tools/config onto a running VM
+├── site.yml                   #   Ansible play (apt, repos, downloads, docker, run_commands…)
+└── profiles/                  #   one YAML per lab profile
+    ├── recherche.yml          #     dev + VS Code
+    ├── v8.yml                 #     build the V8 engine on /data
+    ├── pentest.yml            #     offensive toolkit
+    └── cibles.yml             #     vulnerable web targets (Docker)
 ```
 
 ---
@@ -92,12 +99,15 @@ make destroy      # tear the VM down
 | `bake`   | Fetch latest ISO, then build the golden qcow2 (flavour set by `DESKTOP`/`GUI`/`META`) |
 | `install`| Copy the baked image into the pool as `$(GOLDEN).qcow2` and refresh it |
 | `deploy` | Deploy `VM=<name>` from `GOLDEN=<name>` in its own Terraform workspace |
+| `provision`| Apply a lab profile (`PROFILE=`) to a running VM over SSH — installs tools/repos |
 | `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a browser over X11 / non-interactive check |
 | `start` / `stop` / `reboot` / `restart` / `status` / `autostart` | VM lifecycle via `virsh` (all honour `VM=`) |
 | `snapshot` / `snapshots` / `revert` / `snapshot-delete` | Point-in-time snapshots (`SNAP=`, default `clean`) |
 | `data-create` / `data-delete` | Create / delete the persistent `/data` image `$(VM)-data.raw` (`DATA_GB=`) |
 | `apps-save` / `apps-restore` | Export / re-install the VM's package selection (survives a destroy+rebuild) |
 | `info` / `provenance` | Show a VM's provenance: libvirt description + live `/etc/kali-lab-build.json` |
+| `export` | Export a qcow2 (flatten+compress; `MAXSIZE=` to split, `PASSWORD=` to encrypt) |
+| `reset`  | Force-remove a VM's orphan libvirt domain/overlay/cloudinit (keeps `<vm>-data.raw`) |
 | `all`    | `bake → install → deploy → smoke` |
 | `destroy` / `clean` | Destroy `VM=<name>` (its workspace) / remove local build artifacts |
 
@@ -123,6 +133,8 @@ they work on any deployed domain (not just the last one).
 | `UPGRADE` | `true` | Run a full `apt upgrade` at bake time (patches the rolling release) |
 | `SHARE`   | `$(CURDIR)/shared` | Host dir shared into the guest over virtiofs at `/mnt/host`. `SHARE=` (empty) disables it |
 | `SHARE_TAG` | `hostshare` | virtiofs mount tag |
+| `SWAP`    | `2G` | cloud-init swap file size on first boot (no swap partition); `SWAP=` disables |
+| `PROFILE` | `recherche` | Lab profile (`provision/profiles/<name>.yml`) applied by `make provision` |
 | `DATA`    | `false` | `deploy DATA=true` attaches the persistent data disk on `/data` |
 | `DATA_GB` | `10` | Size of the data image created by `make data-create` |
 | `SRC`     | `$(VM)` | Source VM whose saved package list `apps-restore` re-installs |
@@ -246,6 +258,89 @@ ssh -L 5900:localhost:5900 kali@<vm-ip> \
 See §6 of the runbook for noVNC, xrdp/XFCE, and the SPICE console.
 
 ---
+
+## Lab profiles (per-VM provisioning)
+
+The golden stays lean and generic; each research task layers its own tools and
+configuration onto a **running** VM from a declarative profile
+(`provision/profiles/<name>.yml`), applied over SSH with Ansible — idempotent and
+re-runnable, no rebake:
+
+```bash
+make deploy    VM=poste GOLDEN=kali-desktop DATA=true
+make provision VM=poste PROFILE=recherche      # installs the profile's tools
+```
+
+A profile lists the packages and external repositories to set up. `provision/profiles/recherche.yml`:
+
+```yaml
+apt_packages: [ awscli, git, python3-pip, wireshark, tmux, jq ]
+apt_repos:
+  - name: vscode
+    key_url: https://packages.microsoft.com/keys/microsoft.asc
+    keyring: /etc/apt/keyrings/microsoft.gpg
+    repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
+    packages: [ code ]
+```
+
+Copy it to make your own (`provision/profiles/malware.yml`, `provision/profiles/pentest.yml`, …) and
+select with `PROFILE=`. The provisioning VM needs Internet, which it has via the
+libvirt NAT network.
+
+A profile can use any of these keys (all optional): `apt_packages`, `apt_repos`,
+`min_free_gb`/`min_free_path`, `directories`, `dns`, `host_binaries` (copied from
+the host — e.g. a proprietary IDA installer or analysis samples), `downloads`
+(fetched into the VM, optionally extracted — e.g. Ghidra), `git_repos`, `env_path`,
+`openvpn` (import a `.ovpn` and enable the client), `docker_run` (install Docker and
+run containers), and `run_commands` (build steps). `provision/site.yml` documents each.
+
+Ready-made profiles: `recherche` (dev + VS Code), `v8` (build the V8 engine),
+`pentest` (offensive toolkit), `cibles` (vulnerable web targets in Docker — DVWA,
+WebGoat, Juice Shop). For a lab, deploy the attacker box and the targets as
+**separate VMs**:
+
+```bash
+make deploy VM=attaquant GOLDEN=kali-desktop DATA=true && make provision VM=attaquant PROFILE=pentest
+make deploy VM=cibles    GOLDEN=kali-desktop         && make provision VM=cibles    PROFILE=cibles
+# from the attacker VM/host: http://<cibles-ip>:8080 (DVWA), :8081/WebGoat, :3000 (Juice Shop)
+```
+
+### V8 build profile
+
+`provision/profiles/v8.yml` checks out and compiles V8 on the **persistent /data disk** (so it
+survives destroy/redeploy), after asserting at least 30 GiB free:
+
+```bash
+make data-create VM=v8 DATA_GB=30
+make deploy      VM=v8 GOLDEN=kali-desktop DATA=true
+make provision   VM=v8 PROFILE=v8        # depot_tools → fetch v8 → build d8 (long)
+# result: /data/v8/out/x64.release/d8 --version
+```
+
+It clones depot_tools, runs `fetch v8`, `install-build-deps.sh`, then
+`tools/dev/gm.py x64.release d8`. Steps are guarded (`creates:`) so re-running
+resumes rather than restarting. The fetch and build are large and CPU-heavy —
+give the VM several cores/GB (`MEM=`/`VCPU=` at deploy).
+
+## Exporting an image (`make export`)
+
+Produce a portable copy of a golden (or any pool volume) to move to another host or
+hand to students. It flattens the backing chain into a **standalone** qcow2
+(`qemu-img convert` — no dependency on the golden), then compresses, and optionally
+splits and/or encrypts:
+
+```bash
+make export GOLDEN=kali-desktop                              # one compressed .qcow2 in ./export
+make export GOLDEN=kali-desktop MAXSIZE=2G                   # + split into 2 GiB parts
+make export GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret   # AES-256 7z volumes (encrypted headers)
+make export IMG=poste.qcow2 OUT=/media/usb                  # any pool volume, chosen output dir
+```
+
+Tunables: `IMG` (pool volume, default `$(GOLDEN).qcow2`), `OUT` (dir, default `./export`),
+`MAXSIZE` (e.g. `2G` — omit for no split), `PASSWORD` (omit for no encryption),
+`EXPORT_NAME` (base name, default `<img>-<date>`). A `.sha256` of the parts is written.
+Rebuild: plain split → `cat NAME.qcow2.part-* > NAME.qcow2`; encrypted → `7z x NAME.7z`
+(joins volumes and prompts for the password). `7z` needs `p7zip-full`.
 
 ## Provenance and persistence
 

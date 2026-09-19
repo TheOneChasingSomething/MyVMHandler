@@ -49,6 +49,13 @@ SRC        ?= $(VM)
 SPICE      ?= true
 SHARE      ?= $(CURDIR)/shared
 SHARE_TAG  ?= hostshare
+SWAP       ?= 2G
+PROFILE    ?= recherche
+IMG        ?= $(GOLDEN).qcow2
+OUT        ?= $(CURDIR)/export
+MAXSIZE    ?=
+PASSWORD   ?=
+EXPORT_NAME ?=
 VENV       ?= venv
 TF         ?= terraform
 TF_VERSION ?= 1.15.8
@@ -69,6 +76,8 @@ LIVE_IP = ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/nu
 
 BUILD_DIR   := build
 DEPLOY_DIR  := deploy
+PROVISION_DIR := provision
+PROFILES_DIR  := provision/profiles
 APPS_DIR    := $(BUILD_DIR)/apps
 MANIFEST_DIR := $(BUILD_DIR)/manifests
 
@@ -81,7 +90,7 @@ POOL_PATH = virsh -c qemu:///system pool-dumpxml $(POOL) 2>/dev/null | sed -n 's
 # `deploy GOLDEN=` picks which to clone.
 PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
 
-.PHONY: help check tools ensure-terraform venv iso bake install deploy ip ssh gui smoke all start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance
+.PHONY: help check tools ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -222,7 +231,17 @@ deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true atta
 	  { $(TF) workspace select $(VM) 2>/dev/null || $(TF) workspace new $(VM); } && \
 	  $(TF) apply -auto-approve -var 'vm_name=$(VM)' -var 'golden_volume=$(GOLDEN).qcow2' -var 'pool=$(POOL)' \
 	    -var 'memory_mb=$(MEM)' -var 'vcpu=$(VCPU)' -var 'disk_gb=$(DISK)' -var 'enable_spice_agent=$(SPICE)' \
-	    -var "data_disk_path=$$dpath" -var "share_path=$$spath" -var 'share_tag=$(SHARE_TAG)'
+	    -var "data_disk_path=$$dpath" -var "share_path=$$spath" -var 'share_tag=$(SHARE_TAG)' \
+	    -var 'swap_size=$(SWAP)'
+
+provision: ## Apply a lab profile to a deployed VM over SSH (PROFILE=, Ansible)
+	@test -f $(PROFILES_DIR)/$(PROFILE).yml || { echo "[!] $(PROFILES_DIR)/$(PROFILE).yml introuvable"; exit 1; }
+	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — VM démarrée ? 'make status'"; exit 1; }; \
+	  echo ">> Provisioning $(VM) ($$ip) avec le profil '$(PROFILE)'"; \
+	  $(ACTIVATE) && ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
+	    -i "$$ip," -u $(SSH_USER) \
+	    -e "ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'" \
+	    $(PROVISION_DIR)/site.yml -e @$(PROFILES_DIR)/$(PROFILE).yml
 
 ip: ## Print the VM's current IP (guest agent → lease → TF output)
 	@$(LIVE_IP); echo "$$ip"
@@ -244,6 +263,14 @@ smoke: ## Non-interactive connectivity + identity check
 	      $(SSH_USER)@$$ip 'echo "OK: $$(hostname) — $$(grep PRETTY_NAME /etc/os-release | cut -d= -f2)"'
 
 all: bake install deploy smoke ## Full pipeline: bake -> install -> deploy -> smoke (no sudo)
+
+reset: ## Force-remove a VM's libvirt domain + overlay/cloudinit (keeps <vm>-data.raw)
+	-virsh -c qemu:///system destroy $(VM) 2>/dev/null
+	-virsh -c qemu:///system undefine $(VM) --nvram 2>/dev/null
+	-virsh -c qemu:///system vol-delete --pool $(POOL) $(VM).qcow2 2>/dev/null
+	-virsh -c qemu:///system vol-delete --pool $(POOL) $(VM)-cloudinit.iso 2>/dev/null
+	@echo ">> Reset libvirt de '$(VM)' — orphelins supprimés ($(VM)-data.raw conservé)."
+	@echo "   Purge l'état Terraform puis redéploie :  make destroy VM=$(VM) ; make deploy VM=$(VM) GOLDEN=<golden>"
 
 # ---- VM lifecycle (virsh on the persistent domain, no Terraform needed) ----
 start: ## Start the VM if it is stopped
@@ -336,6 +363,48 @@ info: ## Show a VM's provenance (libvirt description + live guest manifest)
 	  else echo "  (pas d'IP — VM éteinte ?)"; fi
 
 provenance: info ## Alias of 'make info'
+
+# ---- Export a portable copy of a qcow2 image --------------------------------
+# Flattens the backing chain into a standalone qcow2 (qemu-img convert), then:
+#   * PASSWORD= : wrap in a 7z archive (AES-256, encrypted headers) — compressed,
+#                 and split into MAXSIZE volumes when set;
+#   * else      : compressed qcow2 (qemu-img -c), split into MAXSIZE chunks when set.
+# A .sha256 of the output parts is written for integrity checking.
+#   make export GOLDEN=kali-desktop                       # one compressed qcow2
+#   make export GOLDEN=kali-desktop MAXSIZE=2G            # + split into 2 GiB parts
+#   make export GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret   # encrypted 7z volumes
+#   make export IMG=poste.qcow2 OUT=/media/usb           # any pool volume / output dir
+export: ## Export a qcow2 (MAXSIZE= to split, PASSWORD= to encrypt) — see comments
+	@command -v qemu-img >/dev/null || { echo "[!] qemu-img requis"; exit 1; }
+	@src="$$($(POOL_PATH))/$(IMG)"; \
+	  [ -f "$$src" ] || { echo "[!] image introuvable: $$src (IMG=$(IMG), POOL=$(POOL))"; exit 1; }; \
+	  mkdir -p "$(OUT)"; \
+	  base=$$(basename "$(IMG)" .qcow2); \
+	  name="$(EXPORT_NAME)"; [ -n "$$name" ] || name="$$base-$$(date +%Y%m%d)"; \
+	  flat="$(OUT)/$$name.qcow2"; \
+	  if [ -n "$(PASSWORD)" ]; then \
+	    command -v 7z >/dev/null || { echo "[!] 7z requis (sudo apt install -y p7zip-full)"; exit 1; }; \
+	    echo ">> Flatten $(IMG) → archive 7z chiffrée (AES-256)$(if $(MAXSIZE), + split $(MAXSIZE),)…"; \
+	    qemu-img convert -O qcow2 "$$src" "$$flat"; \
+	    sz=$$(echo "$(MAXSIZE)" | tr 'A-Z' 'a-z'); \
+	    ( cd "$(OUT)" && 7z a -mhe=on -p"$(PASSWORD)" $(if $(MAXSIZE),-v$$sz,) "$$name.7z" "$$name.qcow2" >/dev/null ); \
+	    rm -f "$$flat"; \
+	    ( cd "$(OUT)" && sha256sum $$name.7z* > "$$name.sha256" ); \
+	    echo ">> Export : $(OUT)/$$name.7z*"; \
+	    echo "   Extraction : 7z x $$name.7z   (7z rejoint les volumes .001/.002… et demande le mot de passe)"; \
+	  else \
+	    echo ">> Flatten + compresse $(IMG) → qcow2$(if $(MAXSIZE), + split $(MAXSIZE),)…"; \
+	    qemu-img convert -c -O qcow2 "$$src" "$$flat"; \
+	    if [ -n "$(MAXSIZE)" ]; then \
+	      ( cd "$(OUT)" && split -b $(MAXSIZE) -d "$$name.qcow2" "$$name.qcow2.part-" && rm -f "$$name.qcow2" \
+	        && sha256sum $$name.qcow2.part-* > "$$name.sha256" ); \
+	      echo ">> Export : $(OUT)/$$name.qcow2.part-*"; \
+	      echo "   Réassemblage : cat $$name.qcow2.part-* > $$name.qcow2"; \
+	    else \
+	      ( cd "$(OUT)" && sha256sum "$$name.qcow2" > "$$name.sha256" ); \
+	      echo ">> Export : $$flat"; \
+	    fi; \
+	  fi
 
 clean: ## Remove local Packer build artifacts (keeps the pool image + manifests)
 	rm -rf $(BUILD_DIR)/output-kali $(BUILD_DIR)/manifest.json $(BUILD_DIR)/packer_cache

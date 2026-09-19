@@ -1,0 +1,35 @@
+# Lab profile — applied to a running VM by:
+#   make provision VM=<vm> PROFILE=recherche
+# Edit freely and add your own profiles as profiles/<name>.yml.
+
+# Packages available directly from the Kali/Debian repositories.
+apt_packages:
+  - awscli          # AWS CLI
+  - git
+  - python3-pip
+  - wireshark
+  - tmux
+  - jq
+
+# External signed apt repositories. Each entry:
+#   name     : short id (also the sources.list.d filename)
+#   key_url  : URL of the ASCII signing key (dearmored automatically)
+#   keyring  : path of the dearmored keyring referenced by 'repo'
+#   repo     : the full 'deb [...] URL suite component' line
+#   packages : packages to install from this repo
+apt_repos:
+  - name: vscode
+    key_url: https://packages.microsoft.com/keys/microsoft.asc
+    keyring: /etc/apt/keyrings/microsoft.gpg
+    repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
+    packages:
+      - code
+
+# --- Reserved for later versions (see provision/site.yml) ---
+# downloads:
+#   - { name: ghidra, url: "https://github.com/NationalSecurityAgency/ghidra/releases/download/.../ghidra_x_PUBLIC.zip", dest: /opt/ghidra }
+# host_binaries:
+#   - { src: "~/labtools/ida.run", dest: /opt/ida.run, mode: "0755" }
+#   - { src: "~/samples/sample.bin", dest: /data/samples/ }
+# dns: [ 1.1.1.1, 9.9.9.9 ]
+# openvpn: { config: "~/vpn/anssi.ovpn" }
