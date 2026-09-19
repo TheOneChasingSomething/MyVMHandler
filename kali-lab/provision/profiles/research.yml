@@ -1,18 +1,20 @@
-# Research profile — dev tools applied to a running VM by:
+# Research workstation profile — applied by:
 #   make provision VM=<vm> PROFILE=research
-# Edit freely and add your own profiles as provision/profiles/<name>.yml.
+# Each block below is a TOP-LEVEL key (column 0). Keep that alignment when you
+# enable/disable sections — indenting a list under the wrong key is what breaks it.
 
-# Packages from the Kali/Debian repositories.
+# --- Packages from the Kali/Debian repositories ---
 apt_packages:
-  - awscli          # AWS CLI
+  - awscli
+  - wmi-client
   - git
   - python3-pip
   - wireshark
   - tmux
   - jq
-  - openjdk-21-jdk  # required by Ghidra 11.x (uncomment the download below)
+  - openjdk-21-jdk        # required by Ghidra 11.x
 
-# External signed apt repositories.
+# --- External signed apt repositories ---
 apt_repos:
   - name: vscode
     key_url: https://packages.microsoft.com/keys/microsoft.asc
@@ -21,33 +23,50 @@ apt_repos:
     packages:
       - code
 
-# ---- Ghidra (off-repo download) ------------------------------------------
-# Fetched and extracted into /opt. Bump the version/URL from the releases page:
-# https://github.com/NationalSecurityAgency/ghidra/releases
-# Needs a JDK (openjdk-21-jdk above). Run it with /opt/ghidra_*/ghidraRun.
-# Uncomment to enable:
-# downloads:
-#   - name: ghidra
-#     url: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
-#     dest: /opt
-#     unarchive: true
-# run_commands:                       # PATH symlink so `make gui BINARY=ghidra` works
-#   - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
-#     become: true
+# --- Ghidra (off-repo download, extracted to /opt) ---
+# Bump the version/URL from https://github.com/NationalSecurityAgency/ghidra/releases
+downloads:
+  - name: ghidra
+    url: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
+    dest: /opt
+    unarchive: true
 
-# ---- DNS resolvers -------------------------------------------------------
-# Overwrites /etc/resolv.conf. Uncomment to enable:
+# --- Commands run after the installs ---
+run_commands:
+  # PATH symlink so `make gui BINARY=ghidra` works
+  - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
+    become: true
+  # OpenCode (AI coding CLI) — installed as the SSH user into ~/.opencode.
+  # NB: never put your Anthropic API key here (this file is versioned). Configure
+  # it per VM with `opencode auth login` (interactive) — see the profile notes.
+  - cmd: "curl -fsSL https://opencode.ai/install | bash"
+    become: false
+    creates: "/home/{{ ansible_user | default('kali') }}/.opencode/bin/opencode"
+
+# --- DNS resolvers (overwrites /etc/resolv.conf) ---
+# Left OFF with vpn_killswitch: a public resolver here would (a) leak DNS while
+# the tunnel is down and (b) block the endpoint's own resolution. Keep the guest
+# on the LAN resolver (DHCP default); the VPN pushes its DNS through the tunnel.
+# Uncomment only if you are NOT using the killswitch:
 # dns:
 #   - 1.1.1.1
 #   - 9.9.9.9
 
-# ---- OpenVPN client (+ optional fail-closed killswitch) ------------------
-# Copies a .ovpn from an ABSOLUTE host path into the VM and enables the client
-# service. vpn_killswitch: true adds an nftables fail-closed firewall so that if
-# the tunnel drops, only the LAN stays reachable and the public IP never leaks.
-# Uncomment and point 'config' at your file:
-# openvpn:
-#   config: /home/me/vpn/lab.ovpn
-#   autostart: true
-# vpn_killswitch: true
-# lan_cidr: "192.168.122.0/24"   # LAN kept open for SSH management (default)
+# --- OpenVPN client ---
+# 'config' is an ABSOLUTE path on the HOST (where you run make). Adjust to yours.
+# Two modes:
+#   * OFFENSIVE LAB (default here): vpn_killswitch: false → SPLIT-TUNNEL. Normal
+#     Internet stays on eth0; only the routes the lab server pushes (e.g. the lab
+#     subnet) go through tun0. Nothing is blocked.
+#   * ANONYMITY: vpn_killswitch: true → FULL-TUNNEL. redirect-gateway is added
+#     automatically (all traffic via tun0) and the fail-closed killswitch blocks
+#     everything else, so the public IP never leaks if the tunnel drops.
+# Force either routing explicitly with openvpn.redirect_all: true/false.
+# Disabled by default (no .ovpn shipped). Uncomment and point 'config' at YOUR
+# absolute host path to enable it. Missing files are skipped with a warning.
+openvpn:
+  config: /home/me/Documents/7_-_Projets/202601201142_-_~~_OSCP_~~/universal.ovpn
+  autostart: true
+  # redirect_all: false      # force split/full regardless of killswitch
+vpn_killswitch: false         # true = full-tunnel + fail-closed killswitch (anonymity)
+lan_cidr: "192.168.122.0/24"
