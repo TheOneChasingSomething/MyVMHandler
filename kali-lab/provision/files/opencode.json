@@ -9,7 +9,8 @@
     },
     "openai": {
       "models": {
-        "gpt-5": {}
+        "gpt-5": {},
+        "gpt-6": {}
       }
     },
     "ollama": {
@@ -30,5 +31,5 @@
       }
     }
   },
-  "model": "anthropic/claude-sonnet-4-5"
+  "model": "openai/gpt-6"
 }

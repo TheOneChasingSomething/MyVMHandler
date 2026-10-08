@@ -91,7 +91,7 @@ POOL_PATH = virsh -c qemu:///system pool-dumpxml $(POOL) 2>/dev/null | sed -n 's
 # `deploy GOLDEN=` picks which to clone.
 PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
 
-.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export
+.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export disk gc
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -427,3 +427,9 @@ export: ## Export a qcow2 (MAXSIZE= to split, PASSWORD= to encrypt) — see comm
 clean: ## Remove local Packer build artifacts (keeps the pool image + manifests)
 	rm -rf $(BUILD_DIR)/output-kali $(BUILD_DIR)/manifest.json $(BUILD_DIR)/packer_cache
 	@echo ">> Cleaned build artifacts (libvirt pool image + build/manifests left intact)"
+
+disk: ## Report libvirt disk usage for the lab (read-only)
+	@DRY_RUN=1 POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh
+
+gc: ## Analyze disk usage and interactively reclaim old VMs / orphaned volumes
+	@POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh

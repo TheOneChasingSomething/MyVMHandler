@@ -5,7 +5,7 @@
 # VM) and the V8 build (profile 'v8' — special-purpose, needs /data). Give the VM
 # room: DISK=40 (+ a golden baked with META=kali-linux-core to avoid duplication).
 
-min_free_gb: 20
+min_free_gb: 10
 min_free_path: /
 
 apt_packages:
