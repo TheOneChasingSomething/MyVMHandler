@@ -65,9 +65,18 @@ run_commands:
 # Force either routing explicitly with openvpn.redirect_all: true/false.
 # Disabled by default (no .ovpn shipped). Uncomment and point 'config' at YOUR
 # absolute host path to enable it. Missing files are skipped with a warning.
+<<<<<<< HEAD
+# openvpn:
+#   config: 
+#   autostart: true
+#   # redirect_all: false      # force split/full regardless of killswitch
+# vpn_killswitch: false         # true = full-tunnel + fail-closed killswitch (anonymity)
+# lan_cidr: "192.168.122.0/24"
+=======
 openvpn:
   config: /home/me/Documents/7_-_Projets/202601201142_-_~~_OSCP_~~/universal.ovpn
   autostart: true
   # redirect_all: false      # force split/full regardless of killswitch
 vpn_killswitch: false         # true = full-tunnel + fail-closed killswitch (anonymity)
-lan_cidr: "192.168.122.0/24"
+#lan_cidr: "192.168.122.0/24"
+>>>>>>> cf3c3ec (add a ad profile)

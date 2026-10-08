@@ -1,0 +1,27 @@
+{
+  "schema_version": "1",
+  "build_date": "{{ ansible_date_time.iso8601 }}",
+  "pipeline_commit": "{{ manifest_pipeline_commit | default('unknown') }}",
+  "golden": {
+    "metapackage": "{{ kali_metapackage }}",
+    "desktop": {{ (enable_desktop | default(false) | bool) | to_json }},
+    "vnc": {{ (enable_gui_vnc | default(false) | bool) | to_json }}
+  },
+  "os": {
+    "distribution": "{{ ansible_distribution }}",
+    "release": "{{ ansible_distribution_release | default('') }}",
+    "version": "{{ ansible_distribution_version | default('') }}",
+    "pretty_name": "{{ kalilab_pretty_name | default('') }}",
+    "kernel": "{{ ansible_kernel }}",
+    "architecture": "{{ ansible_architecture }}"
+  },
+  "update_level": {
+    "full_upgrade_at_bake": {{ (full_upgrade | default(false) | bool) | to_json }},
+    "upgradable_packages": {{ kalilab_upgradable | default(0) | int }},
+    "apt_snapshot_date": "{{ ansible_date_time.date }}"
+  },
+  "iso": {
+    "url": "{{ manifest_iso_url | default('unknown') }}",
+    "sha256": "{{ manifest_iso_sha | default('unknown') }}"
+  }
+}
