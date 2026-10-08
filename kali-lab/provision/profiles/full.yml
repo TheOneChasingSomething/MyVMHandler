@@ -1,0 +1,101 @@
+# Full toolbox profile — everything from research + pentest + ad in one VM.
+#   make provision VM=<vm> PROFILE=full
+# Heavy: desktop dev tools + the offensive toolkit + AD tooling + Ghidra + OpenCode.
+# NOT included: the vulnerable targets (profile 'cibles' — run those on a separate
+# VM) and the V8 build (profile 'v8' — special-purpose, needs /data). Give the VM
+# room: DISK=40 (+ a golden baked with META=kali-linux-core to avoid duplication).
+
+min_free_gb: 20
+min_free_path: /
+
+apt_packages:
+  # dev / base
+  - git
+  - curl
+  - pipx
+  - python3-pip
+  - openjdk-21-jdk        # Ghidra
+  - awscli
+  - wireshark
+  - tmux
+  - jq
+  # recon / scanning
+  - nmap
+  - masscan
+  - whatweb
+  - dnsutils
+  - amass
+  # web / content discovery
+  - gobuster
+  - ffuf
+  - feroxbuster
+  - dirb
+  - nikto
+  - wpscan
+  - sqlmap
+  - wfuzz
+  # smb / ad / network
+  - netexec
+  - enum4linux-ng
+  - responder
+  - smbclient
+  - smbmap
+  # password attacks
+  - hydra
+  - john
+  - hashcat
+  - seclists
+  # frameworks / exploits
+  - metasploit-framework
+  - burpsuite
+  - exploitdb
+
+apt_repos:
+  - name: vscode
+    key_url: https://packages.microsoft.com/keys/microsoft.asc
+    keyring: /etc/apt/keyrings/microsoft.gpg
+    repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
+    packages:
+      - code
+
+downloads:
+  - name: ghidra
+    url: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
+    dest: /opt
+    unarchive: true
+
+git_repos:
+  - repo: https://github.com/swisskyrepo/PayloadsAllTheThings.git
+    dest: /opt/PayloadsAllTheThings
+    depth: 1
+    become: true
+
+# OpenCode config (multi-provider, NO secrets) dropped into the user's home.
+# Keys are set per VM with `opencode auth login` (never committed).
+directories:
+  - { path: /home/kali/.config/opencode, owner: kali, group: kali, mode: "0755" }
+
+host_binaries:
+  - src: opencode.json            # resolved from provision/files/opencode.json
+    dest: /home/kali/.config/opencode/opencode.json
+    owner: kali
+    group: kali
+    mode: "0644"
+
+run_commands:
+  - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
+    become: true
+  - cmd: "pipx ensurepath"
+    become: false
+  - cmd: "curl -fsSL https://opencode.ai/install | bash"
+    become: false
+    creates: "/home/kali/.opencode/bin/opencode"
+  - cmd: "pipx install --force git+https://github.com/fortra/impacket.git"
+    become: false
+    creates: "/home/kali/.local/share/pipx/venvs/impacket"
+  - cmd: "pipx install --force git+https://github.com/Pennyw0rth/NetExec.git"
+    become: false
+    creates: "/home/kali/.local/bin/nxc"
+  - cmd: "pipx install --force bloodhound"
+    become: false
+    creates: "/home/kali/.local/bin/bloodhound-python"

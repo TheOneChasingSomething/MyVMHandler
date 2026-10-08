@@ -73,7 +73,7 @@ ACTIVATE = if [ -f $(VENV)/bin/activate ]; then . $(VENV)/bin/activate; elif [ -
 
 # Resolve the VM's CURRENT IP live: qemu-guest-agent first, then DHCP lease, then
 # the (possibly stale) Terraform output. One line so it works inside a recipe.
-LIVE_IP = ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(VM) --source lease 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip 2>/dev/null)
+LIVE_IP = if ! virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1; then ip=""; else ip=$$(virsh -c qemu:///system domifaddr $(VM) --source agent 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(VM) --source lease 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); [ -n "$$ip" ] || ip=$$(cd $(DEPLOY_DIR) && $(TF) output -raw kali_ip 2>/dev/null); fi
 
 BUILD_DIR   := build
 DEPLOY_DIR  := deploy
@@ -91,7 +91,7 @@ POOL_PATH = virsh -c qemu:///system pool-dumpxml $(POOL) 2>/dev/null | sed -n 's
 # `deploy GOLDEN=` picks which to clone.
 PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
 
-.PHONY: help check tools ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export
+.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -130,6 +130,12 @@ tools: ## Install Packer + Terraform system-wide via HashiCorp apt repo (sudo)
 	  | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
 	sudo apt update && sudo apt install -y terraform packer
 
+hooks: ## Install the git pre-commit hook (blocks committing secrets/VPN/config)
+	@test -d .git || { echo "[!] pas un dépôt git (lance 'git init' d'abord)"; exit 1; }
+	chmod +x .githooks/pre-commit
+	git config core.hooksPath .githooks
+	@echo ">> git hooks activés : core.hooksPath=.githooks (anti-fuite au commit)"
+
 # Ensure $(TF) is callable; if 'terraform' is missing, fetch a local static
 # binary into .bin (no sudo). Latest version resolved from HashiCorp's
 # checkpoint API, falling back to TF_VERSION.
@@ -153,9 +159,12 @@ ensure-terraform:
 	fi
 
 venv: ## Create ./venv and install Ansible (from requirements.txt)
-	python3 -m venv $(VENV)
-	$(VENV)/bin/pip install --upgrade pip wheel
-	$(VENV)/bin/pip install -r requirements.txt
+	@# --clear rebuilds cleanly even over a venv copied from another machine/path
+	@# (a venv is NOT relocatable: its scripts hard-code the interpreter path).
+	@# Invoke pip via `python -m pip` so we never rely on the pip script shebang.
+	python3 -m venv --clear $(VENV)
+	$(VENV)/bin/python -m pip install --upgrade pip wheel
+	$(VENV)/bin/python -m pip install -r requirements.txt
 	@echo ">> venv pret : $(VENV) — $$($(VENV)/bin/ansible --version | head -1)"
 
 validate: ensure-terraform ## packer validate + terraform validate (needs the venv)

@@ -1,0 +1,41 @@
+#!/bin/sh
+# Pre-commit guard against leaking machine-local config / secrets:
+#   * VPN profiles (.ovpn — e.g. an OSCP/HTB lab VPN),
+#   * private keys and cert bundles,
+#   * .env and OpenCode auth store (hold API keys),
+#   * anything in the staged diff that looks like an API key / private key.
+# Install once per clone with: make hooks
+# Bypass (discouraged): git commit --no-verify
+set -eu
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+# 1) Forbidden paths / extensions (never versioned).
+for f in $staged; do
+  case "$f" in
+    *.ovpn|*.key|*.pem|*.p12|*.pfx|*id_rsa|*id_rsa.*|*id_ed25519|.env|*/.env|*auth.json)
+      echo "[pre-commit] REFUS: fichier sensible stage: '$f'"
+      fail=1 ;;
+  esac
+done
+
+# 2) Secret-looking content in the staged diff (added lines only).
+if git diff --cached -U0 --diff-filter=ACM \
+   | grep -En '^\+' \
+   | grep -Eiq 'sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9]{20,}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|(ANTHROPIC|OPENAI)_API_KEY[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_-]{8,}'; then
+  echo "[pre-commit] REFUS: le diff contient une clé API / clé privée en clair."
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  echo "Commit bloque pour eviter une fuite. Retirez le(s) element(s) de l'index :"
+  echo "  git restore --staged <fichier>      # ou: git rm --cached <fichier>"
+  echo "Puis verifiez qu'ils sont bien dans .gitignore."
+  echo "Contournement (deconseille) : git commit --no-verify"
+  exit 1
+fi
+exit 0

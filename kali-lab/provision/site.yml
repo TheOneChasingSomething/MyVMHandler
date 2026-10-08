@@ -1,0 +1,425 @@
+---
+# Post-deploy provisioning of a running lab VM from a profile (profiles/<name>.yml),
+# applied over SSH by `make provision VM=<vm> PROFILE=<name>`. Idempotent and
+# re-runnable: it does not touch the golden image, so each research task can layer
+# a different tool set onto the same disposable VM.
+#
+# Supported profile keys (all optional):
+#   apt_packages   : [ pkg, ... ]                      flat list of packages
+#   apt_repos      : [ { name, key_url, keyring, repo, packages:[] } ]
+#   min_free_gb    : N   (+ min_free_path)             fail early if too little space
+#   directories    : [ { path, owner, group, mode, state } ]
+#   dns            : [ 1.1.1.1, ... ]                  overwrite /etc/resolv.conf
+#   host_binaries  : [ { src (HOST path), dest, mode } ] copy from control host
+#   downloads      : [ { url, dest, mode, unarchive } ] fetch (optionally extract)
+#   git_repos      : [ { repo, dest, version, depth, update } ]
+#   env_path       : [ /opt/tool/bin, ... ]            prepend to PATH (login + run_commands)
+#   openvpn        : { config (HOST .ovpn), autostart } import + enable client
+#   run_commands   : [ { cmd, chdir, creates, become, env } ] arbitrary steps
+- name: Provision a deployed lab VM from a profile
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    apt_packages: []
+    apt_repos: []
+    min_free_gb: 0
+    min_free_path: /
+    directories: []
+    dns: []
+    host_binaries: []
+    downloads: []
+    git_repos: []
+    env_path: []
+    openvpn: {}
+    vpn_killswitch: false
+    lan_cidr: "192.168.122.0/24"
+    docker_run: []
+    run_commands: []
+
+  tasks:
+    # ---- Preconditions ----------------------------------------------------
+    # Provisioning needs Internet (apt, downloads). A killswitch left active by a
+    # PREVIOUS run — even if THIS profile no longer sets vpn_killswitch — would
+    # block it ("Network is unreachable"). So lift it unconditionally at the start
+    # (stop the service so it can't re-apply mid-run, then flush the ruleset).
+    # If the profile wants the killswitch, the block below re-applies it at the end;
+    # if not, the task further down disables it for good.
+    - name: Lift any leftover VPN killswitch so this run has Internet
+      ansible.builtin.shell: |
+        systemctl stop vpn-killswitch 2>/dev/null || true
+        command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    - name: Check free disk space
+      when: (min_free_gb | int) > 0
+      block:
+        - name: Read available bytes on the target path
+          ansible.builtin.command: "df -B1 --output=avail {{ min_free_path }}"
+          register: df_avail
+          changed_when: false
+        - name: Assert enough free space
+          ansible.builtin.assert:
+            that: "(df_avail.stdout_lines[1] | int) >= (min_free_gb | int) * 1073741824"
+            fail_msg: "Moins de {{ min_free_gb }} GiB libres sur {{ min_free_path }} — agrandis le disque (DATA_GB= / DISK=) puis redéploie."
+            success_msg: "{{ min_free_gb }} GiB requis disponibles sur {{ min_free_path }}."
+
+    # ---- apt packages + external signed repositories (v1) -----------------
+    - name: Ensure the apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+      when: apt_repos | length > 0
+
+    - name: Fetch external repository signing keys
+      ansible.builtin.get_url:
+        url: "{{ item.key_url }}"
+        dest: "{{ item.keyring }}.asc"
+        mode: "0644"
+      loop: "{{ apt_repos }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.key_url is defined
+
+    - name: Dearmor the signing keys
+      ansible.builtin.command:
+        cmd: "gpg --batch --yes --dearmor -o {{ item.keyring }} {{ item.keyring }}.asc"
+        creates: "{{ item.keyring }}"
+      loop: "{{ apt_repos }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.key_url is defined
+
+    - name: Register the external repositories
+      ansible.builtin.copy:
+        dest: "/etc/apt/sources.list.d/{{ item.name }}.list"
+        content: "{{ item.repo }}\n"
+        mode: "0644"
+      loop: "{{ apt_repos }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.repo is defined
+
+    - name: Refresh apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      when: (apt_repos | length > 0) or (apt_packages | length > 0)
+
+    - name: Install packages from each external repository
+      ansible.builtin.apt:
+        name: "{{ item.packages }}"
+        state: present
+      loop: "{{ apt_repos }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.packages is defined
+        - (item.packages | length) > 0
+
+    - name: Install the profile's apt packages
+      ansible.builtin.apt:
+        name: "{{ apt_packages }}"
+        state: present
+      when: apt_packages | length > 0
+
+    # ---- Directories (create / own) ---------------------------------------
+    - name: Create / own directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state | default('directory') }}"
+        owner: "{{ item.owner | default(omit) }}"
+        group: "{{ item.group | default(omit) }}"
+        mode: "{{ item.mode | default('0755') }}"
+      loop: "{{ directories }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # ---- DNS --------------------------------------------------------------
+    # Overwrites /etc/resolv.conf. NB: NetworkManager may rewrite it later; for a
+    # persistent lab override this is usually fine, refine per your host if needed.
+    - name: Configure DNS resolvers
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        mode: "0644"
+        content: |
+          {% for ns in dns %}
+          nameserver {{ ns }}
+          {% endfor %}
+      when: dns | length > 0
+
+    # ---- Host files (pushed from the control host) ------------------------
+    # item.src is an absolute host path, OR a bare filename resolved from
+    # provision/files/ (Ansible's copy files/ lookup). owner/group let a file
+    # land in a user's home with the right ownership.
+    - name: Copy host files into the VM
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode | default('0644') }}"
+        owner: "{{ item.owner | default(omit) }}"
+        group: "{{ item.group | default(omit) }}"
+      loop: "{{ host_binaries }}"
+      loop_control:
+        label: "{{ item.src }}"
+
+    # ---- Downloads (into the VM) ------------------------------------------
+    - name: Ensure download destination directories
+      ansible.builtin.file:
+        path: "{{ (item.unarchive | default(false)) | ternary(item.dest, item.dest | dirname) }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ downloads }}"
+      loop_control:
+        label: "{{ item.url }}"
+
+    - name: Download plain files
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode | default('0644') }}"
+      loop: "{{ downloads }}"
+      loop_control:
+        label: "{{ item.url }}"
+      when: not (item.unarchive | default(false))
+
+    - name: Download and extract archives
+      ansible.builtin.unarchive:
+        src: "{{ item.url }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+      loop: "{{ downloads }}"
+      loop_control:
+        label: "{{ item.url }}"
+      when: item.unarchive | default(false)
+
+    # ---- git repositories -------------------------------------------------
+    - name: Ensure git repo parent directories
+      ansible.builtin.file:
+        path: "{{ item.dest | dirname }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ git_repos }}"
+      loop_control:
+        label: "{{ item.repo }}"
+
+    # NB: use item.get('update', ...) — 'update' is a dict METHOD, and BOTH
+    # item.update and item['update'] fall back to that method for a missing key
+    # (Jinja tries getitem then getattr), which breaks templating on recent
+    # ansible-core. item.get() calls the method and returns a value instead.
+    - name: Clone / update git repositories
+      ansible.builtin.git:
+        repo: "{{ item['repo'] }}"
+        dest: "{{ item['dest'] }}"
+        version: "{{ item['version'] | default('HEAD') }}"
+        depth: "{{ item['depth'] | default(omit) }}"
+        update: "{{ item.get('update', false) }}"
+      become: "{{ item.get('become', false) }}"
+      loop: "{{ git_repos }}"
+      loop_control:
+        label: "{{ item['repo'] }}"
+
+    # ---- PATH additions (login shells) ------------------------------------
+    - name: Prepend directories to PATH for login shells
+      ansible.builtin.copy:
+        dest: /etc/profile.d/lab-path.sh
+        mode: "0644"
+        content: "export PATH=\"{{ env_path | join(':') }}:$PATH\"\n"
+      when: env_path | length > 0
+
+    # ---- OpenVPN ----------------------------------------------------------
+    - name: Check the .ovpn exists on the controller
+      ansible.builtin.stat:
+        path: "{{ openvpn.config }}"
+      delegate_to: localhost
+      become: false
+      register: ovpn_stat
+      when: openvpn.config is defined
+
+    - name: Warn when the .ovpn is missing (VPN skipped)
+      ansible.builtin.debug:
+        msg: "[skip] openvpn.config '{{ openvpn.config }}' not found on the controller — OpenVPN not configured."
+      when:
+        - openvpn.config is defined
+        - not (ovpn_stat.stat.exists | default(false))
+
+    - name: Configure an OpenVPN client
+      when:
+        - openvpn.config is defined
+        - ovpn_stat.stat.exists | default(false)
+      block:
+        - name: Install openvpn
+          ansible.builtin.apt:
+            name: openvpn
+            state: present
+        - name: Copy the .ovpn profile
+          ansible.builtin.copy:
+            src: "{{ openvpn.config }}"
+            dest: "/etc/openvpn/client/lab.conf"
+            mode: "0600"
+        # Full-tunnel vs split-tunnel:
+        #  * redirect_all true  → redirect-gateway def1 sends ALL traffic through
+        #    tun0 (anonymity). Pairs with the killswitch, hence the default below.
+        #  * redirect_all false → split-tunnel: only the routes the server pushes
+        #    (e.g. an offensive-security lab subnet) go via tun0, normal Internet
+        #    stays on eth0. This is the right mode for a HTB/OffSec-style lab.
+        # Default = vpn_killswitch: full-tunnel only when the killswitch is on;
+        # a lab (vpn_killswitch: false) is split-tunnel. Override per profile.
+        - name: Route all traffic through the VPN (redirect-gateway)
+          ansible.builtin.lineinfile:
+            path: /etc/openvpn/client/lab.conf
+            line: "redirect-gateway def1"
+            state: "{{ (openvpn.redirect_all | default(vpn_killswitch | default(false))) | ternary('present', 'absent') }}"
+        # restarted (not started): pick up the config above even if already running.
+        - name: Enable + (re)start the OpenVPN client service
+          ansible.builtin.systemd:
+            name: "openvpn-client@lab"
+            enabled: "{{ openvpn.autostart | default(true) }}"
+            state: "{{ (openvpn.autostart | default(true)) | ternary('restarted', omit) }}"
+
+    # ---- VPN killswitch (fail-closed egress — protects the public IP) ------
+    # Default-deny outbound except: loopback, the LAN (keeps SSH management),
+    # the VPN endpoint(s) parsed from the .ovpn (so the tunnel can connect), and
+    # anything via tun0. If the VPN drops, only the LAN stays reachable, so the
+    # real public IP never leaks (same idea as tasket/Qubes-vpn-support). It is
+    # applied at boot by a systemd unit, so it is fail-closed across reboots too.
+    - name: Install a fail-closed VPN killswitch (nftables)
+      when: vpn_killswitch | default(false) | bool
+      block:
+        - name: Install nftables
+          ansible.builtin.apt:
+            name: nftables
+            state: present
+
+        - name: Install the killswitch script
+          ansible.builtin.copy:
+            dest: /usr/local/sbin/vpn-killswitch.sh
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              # Fail-closed egress firewall for a VPN client. Blocks all outbound
+              # traffic except loopback, the LAN, the VPN endpoint(s), and tun0.
+              set -euo pipefail
+              OVPN="${1:-/etc/openvpn/client/lab.conf}"
+              LAN="${2:-192.168.122.0/24}"
+              TUN="${3:-tun0}"
+              PROTO_DEFAULT=$(awk '/^[[:space:]]*proto /{print tolower($2); exit}' "$OVPN" 2>/dev/null || true)
+              PROTO_DEFAULT=${PROTO_DEFAULT:-udp}
+              nft flush ruleset
+              nft add table inet killswitch
+              nft add chain inet killswitch out '{ type filter hook output priority 0 ; policy drop ; }'
+              nft add rule inet killswitch out oifname "lo" accept
+              nft add rule inet killswitch out ct state established,related accept
+              nft add rule inet killswitch out ip daddr $LAN counter accept
+              nft add rule inet killswitch out oifname "$TUN" counter accept
+              # NOTE: no public-DNS allowance on purpose (it would leak DNS while
+              # the tunnel is down). DNS to the LAN resolver is already covered by
+              # the LAN rule above; once the tunnel is up, DNS goes through tun0.
+              # So keep the guest on the LAN resolver (do not set a public dns:),
+              # or put the VPN endpoint as an IP in the .ovpn.
+              # Allow reaching each VPN endpoint so the tunnel can be established.
+              while read -r host port proto; do
+                [ -n "$host" ] || continue
+                [ -n "$port" ] || port=1194
+                case "${proto,,}" in tcp*) proto=tcp;; udp*) proto=udp;; *) proto=$PROTO_DEFAULT;; esac
+                for ip in $(getent ahostsv4 "$host" | awk '{print $1}' | sort -u); do
+                  nft add rule inet killswitch out ip daddr "$ip" $proto dport "$port" accept
+                done
+              done < <(awk '/^[[:space:]]*remote /{print $2" "$3" "$4}' "$OVPN")
+              # Log + count everything that is blocked, so the killswitch is
+              # observable: `nft list ruleset` shows the counters, and blocked
+              # attempts appear in the kernel log (journalctl -k / dmesg).
+              nft add rule inet killswitch out counter log prefix '"[KILLSWITCH DROP] "' drop
+              echo "[killswitch] active — egress limited to LAN + VPN endpoint + $TUN"
+
+        - name: Install the killswitch systemd unit
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/vpn-killswitch.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=Fail-closed VPN killswitch (nftables)
+              After=network-pre.target
+              Wants=network-pre.target
+              Before=openvpn-client@lab.service
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/sbin/vpn-killswitch.sh /etc/openvpn/client/lab.conf {{ lan_cidr | default('192.168.122.0/24') }}
+              RemainAfterExit=yes
+              [Install]
+              WantedBy=multi-user.target
+
+        # restarted (not started): the unit is a oneshot with RemainAfterExit, so
+        # if it is already active from boot, `started` is a no-op and the rules
+        # flushed at the top of this run would never be re-applied. `restarted`
+        # forces the script to run again and re-install the ruleset now.
+        - name: Enable + (re)apply the killswitch
+          ansible.builtin.systemd:
+            name: vpn-killswitch
+            enabled: true
+            state: restarted
+            daemon_reload: true
+
+    # When the profile does NOT want the killswitch, make sure a leftover one from
+    # a previous run is gone for good (stopped + disabled), so Internet stays open
+    # and it does not re-apply at the next boot. Rules were already flushed above.
+    - name: Ensure the killswitch is disabled when not requested
+      ansible.builtin.systemd:
+        name: vpn-killswitch
+        enabled: false
+        state: stopped
+      failed_when: false
+      when: not (vpn_killswitch | default(false) | bool)
+
+    # ---- Docker containers (e.g. vulnerable web targets) ------------------
+    - name: Set up Docker and run containers
+      when: docker_run | length > 0
+      block:
+        - name: Install Docker
+          ansible.builtin.apt:
+            name:
+              - docker.io
+              - docker-compose
+            state: present
+        - name: Enable and start the Docker service
+          ansible.builtin.systemd:
+            name: docker
+            enabled: true
+            state: started
+        - name: Add the SSH user to the docker group
+          ansible.builtin.user:
+            name: "{{ ansible_user | default('kali') }}"
+            groups: docker
+            append: true
+        # Idempotent: only `docker run` a container whose name is not already present.
+        - name: Launch containers
+          ansible.builtin.shell:
+            cmd: >-
+              docker inspect {{ item.name }} >/dev/null 2>&1 && echo EXISTS ||
+              docker run -d --name {{ item.name }}
+              --restart {{ item.restart | default('unless-stopped') }}
+              {% for p in item.ports | default([]) %}-p {{ p }} {% endfor %}
+              {% for k, v in (item.env | default({})).items() %}-e {{ k }}={{ v | quote }} {% endfor %}
+              {{ item.image }}
+          register: docker_launch
+          changed_when: "'EXISTS' not in docker_launch.stdout"
+          loop: "{{ docker_run }}"
+          loop_control:
+            label: "{{ item.name }} ({{ item.image }})"
+
+    # ---- Arbitrary commands (builds, setup steps) -------------------------
+    # Runs as the SSH user by default (become:false) — right for build tools like
+    # depot_tools/gclient that dislike root. env_path is added to PATH so cloned
+    # tools are found. Use `creates:` to keep long steps idempotent.
+    - name: Run profile commands
+      ansible.builtin.shell:
+        cmd: "{{ item.cmd }}"
+        chdir: "{{ item.chdir | default(omit) }}"
+        creates: "{{ item.creates | default(omit) }}"
+      become: "{{ item.become | default(false) }}"
+      environment: "{{ ({'PATH': (env_path | join(':')) ~ ':' ~ ansible_facts.env.PATH} if (env_path | length > 0) else {}) | combine(item.env | default({})) }}"
+      loop: "{{ run_commands }}"
+      loop_control:
+        label: "{{ item.cmd | truncate(60) }}"
