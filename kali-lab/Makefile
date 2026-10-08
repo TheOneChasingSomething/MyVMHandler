@@ -130,11 +130,18 @@ tools: ## Install Packer + Terraform system-wide via HashiCorp apt repo (sudo)
 	  | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
 	sudo apt update && sudo apt install -y terraform packer
 
-hooks: ## Install the git pre-commit hook (blocks committing secrets/VPN/config)
-	@test -d .git || { echo "[!] pas un dépôt git (lance 'git init' d'abord)"; exit 1; }
-	chmod +x .githooks/pre-commit
-	git config core.hooksPath .githooks
-	@echo ">> git hooks activés : core.hooksPath=.githooks (anti-fuite au commit)"
+hooks: ## Install the git pre-commit hook at the REPO ROOT (blocks committing secrets/VPN/config)
+	@git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+	  || { echo "[!] pas dans un dépôt git — fais 'git init' ici, ou clone le dépôt, puis relance"; exit 1; }
+	@# Install the versioned hook (kali-lab/.githooks) into the repo root's
+	@# .githooks/ and point core.hooksPath there — works whether the repo root is
+	@# kali-lab itself or a parent (e.g. MyVMHandler).
+	@root=$$(git rev-parse --show-toplevel); \
+	  mkdir -p "$$root/.githooks"; \
+	  [ .githooks/pre-commit -ef "$$root/.githooks/pre-commit" ] || cp .githooks/pre-commit "$$root/.githooks/pre-commit"; \
+	  chmod +x "$$root/.githooks/pre-commit"; \
+	  git config core.hooksPath "$$root/.githooks"; \
+	  echo ">> git hooks activés : core.hooksPath=$$root/.githooks (anti-fuite au commit, tout le dépôt)"
 
 # Ensure $(TF) is callable; if 'terraform' is missing, fetch a local static
 # binary into .bin (no sudo). Latest version resolved from HashiCorp's
