@@ -16,6 +16,9 @@
 #   env_path       : [ /opt/tool/bin, ... ]            prepend to PATH (login + run_commands)
 #   openvpn        : { config (HOST .ovpn), autostart } import + enable client
 #   run_commands   : [ { cmd, chdir, creates, become, env } ] arbitrary steps
+#   autostart      : [ { name, exec, gui, terminal } ]  launch apps/services at boot
+#                    gui:true  → XDG .desktop (graphical session, DESKTOP golden)
+#                    gui:false → systemd service as the SSH user (ready over SSH)
 - name: Provision a deployed lab VM from a profile
   hosts: all
   become: true
@@ -37,6 +40,7 @@
     lan_cidr: "192.168.122.0/24"
     docker_run: []
     run_commands: []
+    autostart: []
 
   tasks:
     # ---- Preconditions ----------------------------------------------------
@@ -423,3 +427,62 @@
       loop: "{{ run_commands }}"
       loop_control:
         label: "{{ item.cmd | truncate(60) }}"
+
+    # ---- Autostart applications at VM boot --------------------------------
+    # Launch apps/services automatically when the VM starts. Per-entry mode (gui):
+    #   gui: true  → an XDG autostart .desktop launched by the graphical session
+    #                on login (needs a desktop golden: bake with DESKTOP=true).
+    #   gui: false → a systemd system service (Type=simple, runs as the SSH user),
+    #                started at boot — right for a headless thing you want already
+    #                running when you SSH in (a listener, a web app, a daemon).
+    # Entry keys: { name (slug), exec (command), gui (bool), terminal (gui only) }.
+    # Files are named lab-<name>.* so they are easy to spot and remove by hand.
+    - name: Install GUI autostart entries (XDG)
+      ansible.builtin.copy:
+        dest: "/etc/xdg/autostart/lab-{{ item.name }}.desktop"
+        mode: "0644"
+        content: |
+          [Desktop Entry]
+          Type=Application
+          Name=lab-{{ item.name }}
+          Exec={{ item.exec }}
+          Terminal={{ item.terminal | default(false) | ternary('true', 'false') }}
+          X-GNOME-Autostart-enabled=true
+      loop: "{{ autostart }}"
+      loop_control:
+        label: "{{ item.name }} (gui)"
+      when: item.gui | default(false) | bool
+
+    - name: Install headless autostart services (systemd)
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/lab-autostart-{{ item.name }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Lab autostart: {{ item.name }}
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ ansible_user | default('kali') }}
+          ExecStart={{ item.exec }}
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      loop: "{{ autostart }}"
+      loop_control:
+        label: "{{ item.name }} (service)"
+      when: not (item.gui | default(false) | bool)
+
+    - name: Enable + start headless autostart services
+      ansible.builtin.systemd:
+        name: "lab-autostart-{{ item.name }}.service"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop: "{{ autostart }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not (item.gui | default(false) | bool)

@@ -91,14 +91,43 @@ POOL_PATH = virsh -c qemu:///system pool-dumpxml $(POOL) 2>/dev/null | sed -n 's
 # `deploy GOLDEN=` picks which to clone.
 PACKER_OUT  := $(BUILD_DIR)/output-kali/kali-golden.qcow2
 
-.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance export disk gc
+# ---- Per-target detailed help:  make <target> help  (or: make help <target>)
+# `make help`         → the succinct list below.
+# `make <target> help`→ that target's detailed block: its `## ` summary plus any
+#                       `#:` lines placed right under the target (params/example).
+# When `help` is combined with another goal we enter HELP mode: the real rules
+# are compiled out (the big `else` branch), so the requested goals are harmless
+# no-ops and nothing actually runs — only the detail is printed, warning-free.
+ifneq (,$(filter help,$(MAKECMDGOALS)))
+ifneq (,$(filter-out help,$(MAKECMDGOALS)))
+HELP_TOPIC := $(firstword $(filter-out help,$(MAKECMDGOALS)))
+endif
+endif
+
+ifdef HELP_TOPIC
+.PHONY: $(MAKECMDGOALS)
+$(filter-out help,$(MAKECMDGOALS)):
+	@:
+help:
+	@awk -v t="$(HELP_TOPIC)" ' \
+	  $$0 ~ "^"t":" { s=$$0; sub(/^[^#]*## /,"",s); \
+	    print "Target: " t; if (s!=$$0) print "  " s; found=1; next } \
+	  found && /^#:/ { l=$$0; sub(/^#:[ ]?/,"",l); print "  " l; next } \
+	  found && !/^#:/ { exit } \
+	' $(firstword $(MAKEFILE_LIST))
+	@echo
+else
+
+.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance disk gc note export
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "Vars: META=$(META)  DESKTOP=$(DESKTOP)  GOLDEN=$(GOLDEN)  VM=$(VM)  DATA=$(DATA)  SHARE=$(SHARE)"
 	@echo "      KBD=$(KBD)  UPGRADE=$(UPGRADE)  SPICE=$(SPICE)  MEM=$(MEM)  VCPU=$(VCPU)  DISK=$(DISK)  TF=$(TF)"
+	@echo
+	@echo "Detailed help for a target:  make <target> help   (e.g. make deploy help)"
 
 check: ## Test the toolchain (packer, terraform, ansible venv, KVM/libvirt)
 	@echo "== Environnement =="
@@ -183,6 +212,12 @@ iso: ## Resolve the latest Kali ISO into build/iso.auto.pkrvars.hcl (VARIANT=)
 	cd $(BUILD_DIR) && VARIANT=$(VARIANT) ./fetch-latest-iso.sh
 
 bake: iso ## Fetch latest ISO, then build the golden qcow2 (META=, GUI=, VARIANT=)
+#: Detail  : builds the golden image (STAGE 1) with Packer+Ansible, then writes the
+#:           JSON manifest. Produces build/output-kali/kali-golden.qcow2 (import it
+#:           next with `make install`). Long: downloads the ISO and provisions.
+#: Params  : META=<Kali metapackage>  GUI=true|false  DESKTOP=true|false
+#:           KBD=<layout>  UPGRADE=true|false  RES=<WxH>  VARIANT=installer|live
+#: Example : make bake META=kali-linux-core DESKTOP=true KBD=fr
 	@mkdir -p $(MANIFEST_DIR)
 	@$(ACTIVATE) && cd $(BUILD_DIR) && packer init kali.pkr.hcl && \
 	  PACKER_LOG=1 packer build -force \
@@ -225,6 +260,12 @@ install: ## Upload the baked image into the pool as $(GOLDEN).qcow2 (no sudo, vi
 	fi
 
 deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true attaches /data)
+#: Detail  : instantiates a disposable VM from the golden (COW overlay) via Terraform,
+#:           one workspace per VM. Recreates the root overlay (root data reset); a
+#:           DATA=true disk is reattached intact. Root grows to DISK GiB.
+#: Params  : VM=<name>  GOLDEN=<golden>  DISK=<GiB>  MEM=<MiB>  VCPU=<n>
+#:           DATA=true|false  SPICE=true|false  SHARE=<dir>  SWAP=<size>
+#: Example : make deploy VM=poste GOLDEN=kali-desktop DISK=50 DATA=true
 	@virsh -c qemu:///system vol-info --pool $(POOL) $(GOLDEN).qcow2 >/dev/null 2>&1 \
 	  || { echo "[!] golden '$(GOLDEN).qcow2' absent du pool '$(POOL)' — lance 'make install GOLDEN=$(GOLDEN)'"; exit 1; }
 	@# One Terraform workspace per VM so several VMs coexist, each in its own state.
@@ -252,6 +293,11 @@ deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true atta
 	    -var 'swap_size=$(SWAP)'
 
 provision: ## Apply a lab profile to a deployed VM over SSH (PROFILE=, Ansible)
+#: Detail  : applies a declarative profile (provision/profiles/<name>.yml) to an
+#:           already-deployed VM over SSH, via Ansible. Idempotent and additive:
+#:           chaining profiles stacks the tools (e.g. full then v8).
+#: Params  : VM=<name>  PROFILE=research|pentest|cibles|ad|full|v8  SSH_USER=<user>
+#: Example : make provision VM=poste PROFILE=full
 	@test -f $(PROFILES_DIR)/$(PROFILE).yml || { echo "[!] $(PROFILES_DIR)/$(PROFILE).yml introuvable"; exit 1; }
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — VM démarrée ? 'make status'"; exit 1; }; \
 	  echo ">> Provisioning $(VM) ($$ip) avec le profil '$(PROFILE)'"; \
@@ -269,12 +315,21 @@ ssh: ## Open an interactive SSH session to the VM
 	  ssh -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip
 
 gui: ## Launch a GUI app on the VM over SSH X11 (BINARY=<cmd>, default BROWSER)
+#: Detail  : launches a VM GUI app on YOUR screen over SSH X11 forwarding (ssh -Y).
+#:           One-off; for launch at boot see the `autostart:` profile key
+#:           (make provision help).
+#: Params  : VM=<name>  BINARY=<command>  (default = BROWSER, e.g. firefox-esr)
+#: Example : make gui VM=poste BINARY=ghidra
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \
 	  app="$(BINARY)"; [ -n "$$app" ] || app="$(BROWSER)"; \
 	  echo ">> $$app via X11 on $(SSH_USER)@$$ip (window opens on your screen)"; \
 	  ssh -Y -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $$app
 
 smoke: ## Non-interactive connectivity + identity check
+#: Detail  : non-interactive check — connects over SSH and prints hostname + OS.
+#:           A quick confirmation that a VM is reachable and booted.
+#: Params  : VM=<name>  SSH_USER=<user>
+#: Example : make smoke VM=poste
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — 'make status'"; exit 1; }; \
 	  echo ">> Smoke-testing $(SSH_USER)@$$ip"; \
 	  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
@@ -336,6 +391,11 @@ destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
 # The image is a standalone raw volume that Terraform does NOT own; `make deploy
 # DATA=true` attaches it by path and cloud-init mounts it (by LABEL) on /data.
 data-create: ## Create the persistent data image $(VM)-data.raw (DATA_GB=)
+#: Detail  : creates the persistent data image <VM>-data.raw (raw, sparse), mounted
+#:           at /data and kept across destroy/redeploy. If it already exists it is
+#:           kept (to enlarge it use vol-resize, not this target).
+#: Params  : VM=<name>  DATA_GB=<GiB>
+#: Example : make data-create VM=v8 DATA_GB=30
 	@if virsh -c qemu:///system vol-info --pool $(POOL) $(VM)-data.raw >/dev/null 2>&1; then \
 	  echo ">> '$(VM)-data.raw' existe déjà — conservé (les données sont préservées)"; \
 	else \
@@ -370,7 +430,7 @@ apps-restore: ## Reinstall packages saved from SRC (default $(VM)) onto VM
 # ---- Provenance ----
 info: ## Show a VM's provenance (libvirt description + live guest manifest)
 	@echo "== Provenance de $(VM) =="
-	@echo "-- description libvirt (issue du manifeste du golden) --"
+	@echo "-- description libvirt (manifeste du golden + notes 'make note') --"
 	@virsh -c qemu:///system desc $(VM) 2>/dev/null || echo "  (domaine '$(VM)' introuvable)"
 	@echo; echo "-- /etc/kali-lab-build.json embarqué (si la VM répond) --"
 	@$(LIVE_IP); \
@@ -381,6 +441,38 @@ info: ## Show a VM's provenance (libvirt description + live guest manifest)
 	  else echo "  (pas d'IP — VM éteinte ?)"; fi
 
 provenance: info ## Alias of 'make info'
+
+disk: ## Report libvirt disk usage for the lab (read-only)
+#: Detail  : read-only pool report (virtual capacity vs real allocation), per-volume
+#:           status (in use / protected golden / orphan / detached data) and total
+#:           reclaimable. Deletes nothing.
+#: Params  : POOL=<pool>  GOLDEN=<stem to protect>
+#: Example : make disk
+	@DRY_RUN=1 POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh
+
+gc: ## Analyze disk usage and interactively reclaim old VMs / orphaned volumes
+#: Detail  : same report as `make disk`, then interactive deletion prompts (shut-off
+#:           VMs, orphan volumes, detached data disks with a double confirmation).
+#:           Golden and running VMs are protected.
+#: Params  : POOL=<pool>  GOLDEN=<stem to protect>
+#: Example : make gc
+	@POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh
+
+note: ## Append a timestamped worklog line to the VM's libvirt description (MSG="...")
+#: Detail  : appends a timestamped line to the VM's libvirt description (a
+#:           "last work" log), persistent across reboots and shown by `make info`.
+#:           Reset by a full redeploy.
+#: Params  : VM=<name>  MSG="<text>"
+#: Example : make note VM=poste MSG="d8 fuzzing done, crash triaged"
+	@test -n "$(MSG)" || { echo "[!] MSG= requis — ex: make note VM=$(VM) MSG=\"fuzzing d8 terminé\""; exit 1; }
+	@LC_ALL=C virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1 || { echo "[!] domaine '$(VM)' introuvable"; exit 1; }
+	@cur="$$(virsh -c qemu:///system desc $(VM) 2>/dev/null)"; \
+	  line="[$$(date '+%F %R')] $(MSG)"; \
+	  if [ -n "$$cur" ]; then new="$$cur"$$'\n'"$$line"; else new="$$line"; fi; \
+	  state="$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)"; \
+	  if [ "$$state" = "running" ]; then scope="--config --live"; else scope="--config"; fi; \
+	  virsh -c qemu:///system desc $(VM) $$scope "$$new" >/dev/null && \
+	  echo ">> note added to '$(VM)' : $$line   (see 'make info VM=$(VM)')"
 
 # ---- Export a portable copy of a qcow2 image --------------------------------
 # Flattens the backing chain into a standalone qcow2 (qemu-img convert), then:
@@ -393,6 +485,10 @@ provenance: info ## Alias of 'make info'
 #   make export GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret   # encrypted 7z volumes
 #   make export IMG=poste.qcow2 OUT=/media/usb           # any pool volume / output dir
 export: ## Export a qcow2 (MAXSIZE= to split, PASSWORD= to encrypt) — see comments
+#: Detail  : flattens the backing chain into a standalone qcow2, then compresses
+#:           (and encrypts/splits on request). Writes a .sha256 for integrity.
+#: Params  : GOLDEN=<stem> or IMG=<vol.qcow2>  OUT=<dir>  MAXSIZE=<2G>  PASSWORD=<pass>
+#: Example : make export GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret
 	@command -v qemu-img >/dev/null || { echo "[!] qemu-img requis"; exit 1; }
 	@src="$$($(POOL_PATH))/$(IMG)"; \
 	  [ -f "$$src" ] || { echo "[!] image introuvable: $$src (IMG=$(IMG), POOL=$(POOL))"; exit 1; }; \
@@ -428,8 +524,4 @@ clean: ## Remove local Packer build artifacts (keeps the pool image + manifests)
 	rm -rf $(BUILD_DIR)/output-kali $(BUILD_DIR)/manifest.json $(BUILD_DIR)/packer_cache
 	@echo ">> Cleaned build artifacts (libvirt pool image + build/manifests left intact)"
 
-disk: ## Report libvirt disk usage for the lab (read-only)
-	@DRY_RUN=1 POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh
-
-gc: ## Analyze disk usage and interactively reclaim old VMs / orphaned volumes
-	@POOL=$(POOL) GOLDEN=$(GOLDEN) scripts/disk-gc.sh
+endif  # HELP_TOPIC — end of the real (non-detailed-help) rule set

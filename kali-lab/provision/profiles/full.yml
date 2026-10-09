@@ -99,3 +99,13 @@ run_commands:
   - cmd: "pipx install --force bloodhound"
     become: false
     creates: "/home/kali/.local/bin/bloodhound-python"
+
+
+# dans un profil (profiles/*.yml) ou un profil dédié profiles/autostart.yml
+autostart:
+  # GUI : lancé dans la session graphique (golden baké avec DESKTOP=true)
+  - { name: ghidra, exec: /usr/local/bin/ghidra, gui: true }
+  - { name: burp,   exec: burpsuite, gui: true }
+  # Headless : service systemd lancé au boot, actif dès que vous vous connectez en SSH
+  - { name: http,   exec: "python3 -m http.server 8000 --directory /data", gui: false }
+  - { name: listener, exec: "/usr/bin/nc -lvnp 4444", gui: false }
