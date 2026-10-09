@@ -1,0 +1,10 @@
+# work app list — consumed by `make work` (one command per line).
+# Copy to work/<VM>.apps (e.g. work/poste.apps) and edit.
+# '#' comments and blank lines are ignored. Each line is launched on YOUR
+# screen over SSH X11 (ssh -Y -f), so GUI apps only.
+#
+# Examples:
+ghidra
+burpsuite
+wireshark
+# firefox-esr https://target.lab

@@ -1,6 +1,7 @@
 # Full toolbox profile — everything from research + pentest + ad in one VM.
 #   make provision VM=<vm> PROFILE=full
-# Heavy: desktop dev tools + the offensive toolkit + AD tooling + Ghidra + OpenCode.
+# Heavy: desktop dev tools + the offensive toolkit + AD tooling + Ghidra 12.0.4 +
+# OpenCode + Claude Code, with Ghidra wired to OpenCode over MCP (ghidra-mcp).
 # NOT included: the vulnerable targets (profile 'cibles' — run those on a separate
 # VM) and the V8 build (profile 'v8' — special-purpose, needs /data). Give the VM
 # room: DISK=40 (+ a golden baked with META=kali-linux-core to avoid duplication).
@@ -19,6 +20,8 @@ apt_packages:
   - wireshark
   - tmux
   - jq
+  - maven                 # build the ghidra-mcp extension
+  - unzip
   # recon / scanning
   - nmap
   - masscan
@@ -58,22 +61,31 @@ apt_repos:
     packages:
       - code
 
-downloads:
-  - name: ghidra
-    url: https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.1_build/ghidra_11.3.1_PUBLIC_20250219.zip
-    dest: /opt
-    unarchive: true
+# NB: Ghidra is NOT fetched via `downloads:` — the release asset's filename
+# carries a per-build date stamp (ghidra_12.0.4_PUBLIC_<YYYYMMDD>.zip) that is
+# painful to pin. It is resolved from the GitHub API and extracted in the first
+# run_command below instead (version 12.0.4, to match the ghidra-mcp extension).
 
 git_repos:
   - repo: https://github.com/swisskyrepo/PayloadsAllTheThings.git
     dest: /opt/PayloadsAllTheThings
     depth: 1
     become: true
+  # Ghidra <-> OpenCode MCP bridge (community project — see the MCP doc).
+  - repo: https://github.com/MIGINC/ghidra-mcp.git
+    dest: /home/kali/tools/ghidra-mcp
+    become: false
+  # PromptScope — your own app, PUBLIC GitHub repo. Set the real URL and
+  # uncomment; add its build step in the commented run_commands block below.
+  #- repo: https://github.com/CHANGE_ME/PromptScope.git
+  #  dest: /home/kali/tools/PromptScope
+  #  become: false
 
 # OpenCode config (multi-provider, NO secrets) dropped into the user's home.
 # Keys are set per VM with `opencode auth login` (never committed).
 directories:
   - { path: /home/kali/.config/opencode, owner: kali, group: kali, mode: "0755" }
+  - { path: /home/kali/tools, owner: kali, group: kali, mode: "0755" }
 
 host_binaries:
   - src: opencode.json            # resolved from provision/files/opencode.json
@@ -83,6 +95,17 @@ host_binaries:
     mode: "0644"
 
 run_commands:
+  # Resolve + install Ghidra 12.0.4 from its GitHub release. The asset's date
+  # stamp changes per patch build, so look the URL up via the API rather than
+  # pinning a fragile filename. Idempotent: skipped once /opt/ghidra_*_PUBLIC exists.
+  - cmd: >-
+      ls -d /opt/ghidra_*_PUBLIC >/dev/null 2>&1 ||
+      { url=$(curl -fsSL https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_12.0.4_build
+      | grep -oE 'https://[^"]*ghidra_12\.0\.4_PUBLIC_[0-9]+\.zip' | head -1) ;
+      [ -n "$url" ] || { echo 'cannot resolve the Ghidra 12.0.4 asset URL'; exit 1; } ;
+      echo "downloading $url" ; curl -fsSL "$url" -o /tmp/ghidra.zip
+      && unzip -q -o /tmp/ghidra.zip -d /opt && rm -f /tmp/ghidra.zip ; }
+    become: true
   - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
     become: true
   - cmd: "pipx ensurepath"
@@ -90,6 +113,11 @@ run_commands:
   - cmd: "curl -fsSL https://opencode.ai/install | bash"
     become: false
     creates: "/home/kali/.opencode/bin/opencode"
+  # Claude Code (native installer; idempotent via the `command -v` guard).
+  # Alternative if you prefer npm: `npm install -g @anthropic-ai/claude-code`
+  # (needs Node.js >= 18 — add nodejs/npm to apt_packages in that case).
+  - cmd: "command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash"
+    become: false
   - cmd: "pipx install --force git+https://github.com/fortra/impacket.git"
     become: false
     creates: "/home/kali/.local/share/pipx/venvs/impacket"
@@ -99,13 +127,25 @@ run_commands:
   - cmd: "pipx install --force bloodhound"
     become: false
     creates: "/home/kali/.local/bin/bloodhound-python"
-
-
-# dans un profil (profiles/*.yml) ou un profil dédié profiles/autostart.yml
-autostart:
-  # GUI : lancé dans la session graphique (golden baké avec DESKTOP=true)
-  - { name: ghidra, exec: /usr/local/bin/ghidra, gui: true }
-  - { name: burp,   exec: burpsuite, gui: true }
-  # Headless : service systemd lancé au boot, actif dès que vous vous connectez en SSH
-  - { name: http,   exec: "python3 -m http.server 8000 --directory /data", gui: false }
-  - { name: listener, exec: "/usr/bin/nc -lvnp 4444", gui: false }
+  # ---- Ghidra <-> OpenCode via MCP (per the MIGINC/ghidra-mcp README) --------
+  # Validate the Ghidra path and install the extension's build prereqs (apt deps
+  # need root). The ghidra path is resolved from the unarchived 12.0.4 directory.
+  - cmd: "python3 -m tools.setup preflight --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && python3 -m tools.setup ensure-prereqs --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && touch /home/kali/.ghidra-mcp.prereqs"
+    chdir: /home/kali/tools/ghidra-mcp
+    become: true
+    creates: /home/kali/.ghidra-mcp.prereqs
+  # Build the extension and deploy it into the kali user's Ghidra profile. The
+  # MCP bridge (bridge_mcp_ghidra.py) is then launched by OpenCode via the `mcp`
+  # block in provision/files/opencode.json. Start the server inside Ghidra with
+  # Tools -> GhidraMCP -> Start MCP Server (default port 8089), then `opencode mcp list`.
+  - cmd: "python3 -m tools.setup build && python3 -m tools.setup deploy --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && touch /home/kali/.ghidra-mcp.deployed"
+    chdir: /home/kali/tools/ghidra-mcp
+    become: false
+    creates: /home/kali/.ghidra-mcp.deployed
+  # ---- PromptScope (your app) — PUBLIC repo. Fill in and uncomment -----------
+  # 1) uncomment the git_repos PromptScope entry above with the real URL;
+  # 2) replace <BUILD/INSTALL CMD> with how PromptScope builds/installs, e.g.
+  #    pipx install .  |  pip install -e .  |  npm ci && npm run build  |  make install
+  #- cmd: "<BUILD/INSTALL CMD>"
+  #  chdir: /home/kali/tools/PromptScope
+  #  become: false

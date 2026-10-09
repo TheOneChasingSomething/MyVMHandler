@@ -9,8 +9,7 @@
     },
     "openai": {
       "models": {
-        "gpt-5": {},
-        "gpt-6": {}
+        "gpt-5": {}
       }
     },
     "ollama": {
@@ -31,5 +30,13 @@
       }
     }
   },
-  "model": "openai/gpt-6"
+  "mcp": {
+    "ghidra": {
+      "type": "local",
+      "command": ["python3", "/home/kali/tools/ghidra-mcp/bridge_mcp_ghidra.py"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  },
+  "model": "anthropic/claude-sonnet-4-5"
 }

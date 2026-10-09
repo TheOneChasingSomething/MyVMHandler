@@ -39,6 +39,7 @@ GOLDEN     ?= kali-golden
 SSH_USER   ?= kali
 BROWSER    ?= firefox-esr
 BINARY     ?=
+WORKLIST   ?= work/$(VM).apps
 VM         ?= kali-lab-01
 SNAP       ?= clean
 MEM        ?= 4096
@@ -110,7 +111,7 @@ $(filter-out help,$(MAKECMDGOALS)):
 	@:
 help:
 	@awk -v t="$(HELP_TOPIC)" ' \
-	  $$0 ~ "^"t":" { s=$$0; sub(/^[^#]*## /,"",s); \
+	  $$0 ~ "^"t":" && /## / && !found { s=$$0; sub(/^[^#]*## /,"",s); \
 	    print "Target: " t; if (s!=$$0) print "  " s; found=1; next } \
 	  found && /^#:/ { l=$$0; sub(/^#:[ ]?/,"",l); print "  " l; next } \
 	  found && !/^#:/ { exit } \
@@ -118,7 +119,7 @@ help:
 	@echo
 else
 
-.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui smoke all reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance disk gc note export
+.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance disk gc note export
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -325,6 +326,43 @@ gui: ## Launch a GUI app on the VM over SSH X11 (BINARY=<cmd>, default BROWSER)
 	  echo ">> $$app via X11 on $(SSH_USER)@$$ip (window opens on your screen)"; \
 	  ssh -Y -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $$app
 
+work: ## Start the VM (if needed), wait for SSH, then X11-launch a list of GUI apps
+#: Detail  : "start working" launcher. Powers the VM on if it is shut off, waits for
+#:           SSH, then opens each GUI app from a file on YOUR screen via X11 (ssh -Y -f,
+#:           detached so your shell returns). Not a VM-boot autostart — it runs from
+#:           the host when you start a session. For in-VM boot autostart use the
+#:           `autostart:` profile key instead (make provision help).
+#: File    : one command per line, '#' comments and blank lines ignored.
+#:           Default WORKLIST=work/<VM>.apps ; override with WORKLIST=<path>.
+#:           BINARY=<cmd> launches that single app instead of reading the file.
+#: Params  : VM=<name>  WORKLIST=<file>  BINARY=<cmd>  SSH_USER=<user>
+#: Example : make work VM=poste            # reads work/poste.apps
+#:           make work VM=poste BINARY=ghidra
+	@if [ -n "$(BINARY)" ]; then \
+	   apps="$(BINARY)"; \
+	 elif [ -f "$(WORKLIST)" ]; then \
+	   apps="$$(grep -vE '^[[:space:]]*(#|$$)' "$(WORKLIST)")"; \
+	 else \
+	   echo "[!] no BINARY= and no list '$(WORKLIST)' — create the file (one app per line) or pass BINARY="; exit 1; \
+	 fi; \
+	 [ -n "$$apps" ] || { echo "[!] no application to launch (empty list)"; exit 1; }; \
+	 state="$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)"; \
+	 if [ "$$state" != "running" ]; then echo ">> start $(VM)"; virsh -c qemu:///system start $(VM) >/dev/null || { echo "[!] could not start $(VM)"; exit 1; }; fi; \
+	 echo ">> waiting for SSH on $(VM) ..."; \
+	 ip=""; \
+	 for i in $$(seq 1 60); do \
+	   $(LIVE_IP); \
+	   if [ -n "$$ip" ] && ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip true 2>/dev/null; then break; fi; \
+	   ip=""; sleep 2; \
+	 done; \
+	 [ -n "$$ip" ] || { echo "[!] SSH not available after 120 s — 'make status VM=$(VM)'"; exit 1; }; \
+	 echo "$$apps" | while IFS= read -r app; do \
+	   [ -n "$$app" ] || continue; \
+	   echo ">> launch '$$app' on your screen (X11)"; \
+	   ssh -Y -f -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip $$app || echo "   [!] failed to launch '$$app'"; \
+	 done; \
+	 echo ">> done ($(VM))."
+
 smoke: ## Non-interactive connectivity + identity check
 #: Detail  : non-interactive check — connects over SSH and prints hostname + OS.
 #:           A quick confirmation that a VM is reachable and booted.
@@ -336,6 +374,36 @@ smoke: ## Non-interactive connectivity + identity check
 	      $(SSH_USER)@$$ip 'echo "OK: $$(hostname) — $$(grep PRETTY_NAME /etc/os-release | cut -d= -f2)"'
 
 all: bake install deploy smoke ## Full pipeline: bake -> install -> deploy -> smoke (no sudo)
+
+tui: ## Interactive text menu — asks what to do and runs the right make target
+#: Detail  : dependency-free Python menu (python3 tui.py). Lists actions, lets you
+#:           pick an existing VM / profile, fills defaults from .env, shows the
+#:           make command and runs it. The simplest way in if you don't want to
+#:           memorise targets and variables.
+#: Example : make tui
+	@python3 tui.py
+
+full: DISK := 50
+full: DATA_GB := 30
+full: ## One-shot ready VM: data disk + 50G root + SPICE + virtiofs share + PROFILE=full
+#: Detail  : orchestration in one command — creates the persistent data disk,
+#:           deploys the VM (50 GiB root, SPICE, DATA, virtiofs share), waits for
+#:           SSH (clearing the stale host key from a recreate), then applies the
+#:           'full' profile. Everything below is overridable on the command line.
+#: Params  : VM=<name>  DISK=<GiB,50>  DATA_GB=<GiB,30>  SHARE=<dir>  GOLDEN=<golden>
+#: Example : make full VM=poste SHARE="$HOME/Documents/projetX"
+	@$(MAKE) --no-print-directory data-create VM=$(VM) DATA_GB=$(DATA_GB)
+	@$(MAKE) --no-print-directory deploy VM=$(VM) GOLDEN=$(GOLDEN) DISK=$(DISK) DATA=true SPICE=true SHARE="$(SHARE)"
+	@echo ">> waiting for SSH on $(VM) ..."; \
+	  ip=""; for i in $$(seq 1 90); do \
+	    $(LIVE_IP); \
+	    if [ -n "$$ip" ] && ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(SSH_USER)@$$ip true 2>/dev/null; then \
+	      ssh-keygen -R "$$ip" >/dev/null 2>&1 || true; break; \
+	    fi; ip=""; sleep 2; \
+	  done; \
+	  [ -n "$$ip" ] || { echo "[!] SSH not ready — once up: make provision VM=$(VM) PROFILE=full"; exit 1; }
+	@$(MAKE) --no-print-directory provision VM=$(VM) PROFILE=full
+	@echo ">> '$(VM)' ready (full toolbox, /data, share on /mnt/host)."
 
 reset: ## Force-remove a VM's libvirt domain + overlay/cloudinit (keeps <vm>-data.raw)
 	-virsh -c qemu:///system destroy $(VM) 2>/dev/null
