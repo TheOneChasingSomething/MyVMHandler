@@ -1,17 +1,27 @@
-# Kali Lab VM — Packer + Ansible (bake) → Terraform (deploy)
+# Kali Lab — reproducible Kali VMs (Packer + Ansible → Terraform on libvirt/KVM)
 
-A reproducible, single-machine workflow that **bakes** a lean Kali *golden image*
-once with Packer + Ansible, then **deploys** disposable test VMs from it with
-Terraform on local libvirt/KVM. The heavy `kali-linux-*` install runs **once** at
-build time, not on every boot — the immutable-infrastructure pattern.
-
-See the companion runbook (`kali-packer-ansible-terraform-lab.md`) for the full
-rationale, trade-offs, references, and flashcards. This README is the operational
-guide.
+> One-line entry point: **`make tui`** (interactive menu) or **`make full VM=lab`**
+> (one disposable, fully-tooled Kali VM).
 
 ---
 
-## Architecture
+## 1. Objective
+
+`kali-lab` is a **single-machine, reproducible pipeline** for spinning up throwaway
+Kali Linux VMs for teaching and offensive /
+reverse-engineering labs. It follows the **immutable-infrastructure** pattern:
+
+- **Bake once** — Packer boots the Kali ISO (unattended preseed) and Ansible
+  installs a lean *golden image* (a `qcow2`). The heavy `kali-linux-*` install
+  happens here, not on every boot.
+- **Deploy many** — Terraform clones the golden into disposable VMs on local
+  libvirt/KVM, one per task; cloud-init sets hostname, SSH key, optional swap,
+  a persistent `/data` disk and a host↔guest shared folder.
+- **Provision per VM** — declarative Ansible *profiles* layer tool sets onto a
+  running VM over SSH (research, pentest, AD, vulnerable targets, V8 build, or an
+  all-in-one `full`). Profiles are idempotent and stackable.
+
+Everything is driven from a single `Makefile` (or the `tui.py` menu).
 
 ```
 STAGE 1 — BUILD (once)                         STAGE 2 — DEPLOY (per VM)
@@ -22,495 +32,334 @@ STAGE 1 — BUILD (once)                         STAGE 2 — DEPLOY (per VM)
 │  • Ansible: install metapkg   │ ─────────►  │  • libvirt_domain (KVM)       │
 │  • generalize + cloud-init    │             │  • outputs the VM IP          │
 └───────────────────────────────┘             └──────────────────────────────┘
-```
-
-Key design decisions:
-
-- **Metapackage `kali-linux-headless` by default** — the official toolset minus
-  anything needing X11/GUI; the right lean base for an SSH-only lab VM. Override
-  with `META=` (`kali-linux-core`, `kali-linux-default`, …).
-- **Lean base install** — the preseed pulls no desktop and no default metapackage;
-  Ansible adds exactly the one you choose, keeping bake time and size controllable.
-- **cloud-init baked in** — Terraform injects a per-VM hostname and SSH key at
-  deploy time via the NoCloud datasource.
-- **Image generalization** — `machine-id` truncated and SSH host keys removed so
-  every clone is unique; cloud-init regenerates host keys on first boot.
-
-## Layout
-
-```
-kali-lab/
-├── Makefile                    # the whole pipeline (run `make help`)
-├── requirements.txt            # Ansible (ansible-core) for the venv
-├── build/                      # STAGE 1 — bake the golden image
-│   ├── kali.pkr.hcl            #   Packer template (qemu builder + ansible provisioner)
-│   ├── fetch-latest-iso.sh     #   resolve the current Kali ISO name + sha256
-│   ├── http/preseed.cfg        #   unattended Kali installer answer file
-│   ├── ansible/playbook.yml    #   install metapackage + GUI bits, write manifest, generalize
-│   ├── ansible/templates/      #   kali-lab-build.json.j2 — the build manifest
-│   ├── manifests/              #   per-golden provenance JSON (downloaded after bake)
-│   └── apps/                   #   per-VM package-selection backups (apps-save)
-└── deploy/                     # STAGE 2 — deploy a VM from the image
-    ├── main.tf                 #   volume + cloud-init + domain (+ data disk, description)
-    ├── variables.tf
-    ├── outputs.tf
-    ├── spice.xsl               #   XSLT: virtio-gpu + tablet + SPICE + virtiofs
-    ├── cloud_init.yaml.tftpl
-    └── terraform.tfvars.example
-provision/                     # POST-DEPLOY — layer tools/config onto a running VM
-├── site.yml                   #   Ansible play (apt, repos, downloads, docker, run_commands…)
-└── profiles/                  #   one YAML per lab profile
-    ├── research.yml          #     dev + VS Code
-    ├── v8.yml                 #     build the V8 engine on /data
-    ├── pentest.yml            #     offensive toolkit
-    └── cibles.yml             #     vulnerable web targets (Docker)
+         then:  make provision VM=<vm> PROFILE=<research|pentest|ad|cibles|v8|full>
 ```
 
 ---
 
-## Quick start
+## 2. Prerequisites
 
-```bash
-make check        # verify the toolchain (packer, terraform, ansible, KVM/libvirt)
-make venv         # one-time: create ./venv with Ansible (needed by Packer)
-make all          # bake → install → deploy → smoke, end to end
-```
+### Tech stack (host)
 
-Or step by step:
+The host is a **Linux workstation with hardware virtualisation** (Intel VT-x /
+AMD-V). The pipeline orchestrates these tools; install whatever is missing:
 
-```bash
-make bake         # fetch latest ISO, then build the golden qcow2
-make install      # copy the image into the libvirt pool as $(GOLDEN).qcow2 (sudo)
-make deploy       # terraform apply (per-VM workspace; auto-installs Terraform if missing)
-make ip           # print the VM's current IP (live, via the guest agent)
-make smoke        # non-interactive SSH identity check
-make ssh          # interactive SSH session
-make destroy      # tear the VM down
-```
+| Component | Used for | Notes |
+|---|---|---|
+| **libvirt + QEMU/KVM** | run the VMs | `libvirtd` running; user in the `libvirt` group |
+| **virsh**, **qemu-img** | VM/volume lifecycle | ship with libvirt/qemu |
+| **Packer** ≥ 1.9 | bake the golden | `make tools` installs it (HashiCorp apt repo) |
+| **Terraform** ≥ 1.6 | deploy VMs | `make tools`; provider `dmacvicar/libvirt ~> 0.8` |
+| **Ansible** (via venv) | bake + provision | `make venv` creates `./venv` from `requirements.txt` |
+| **Python 3** ≥ 3.10 | the `tui.py` menu, helpers | stdlib only |
+| **xsltproc** | SPICE/virtio-gpu + virtiofs XSLT at deploy | needed when `SPICE=true` |
+| **unzip, curl, git, make** | misc build steps | usually present |
+| **nftables** (guest) | optional VPN kill-switch | installed by the profile when requested |
 
-### Make targets
+Quick self-check: **`make check`** probes packer, terraform, the Ansible venv and
+KVM/libvirt and reports what is missing.
 
-| Target   | What it does |
-|----------|--------------|
-| `check`  | Environment doctor: packer, terraform, ansible venv, qemu, libvirt reachability, `default` network + pool |
-| `tools`  | Install Packer + Terraform system-wide via HashiCorp's apt repo (sudo) |
-| `venv`   | Create `./venv` and install Ansible from `requirements.txt` |
-| `iso`    | Resolve the latest Kali ISO into `build/iso.auto.pkrvars.hcl` |
-| `bake`   | Fetch latest ISO, then build the golden qcow2 (flavour set by `DESKTOP`/`GUI`/`META`) |
-| `install`| Copy the baked image into the pool as `$(GOLDEN).qcow2` and refresh it |
-| `deploy` | Deploy `VM=<name>` from `GOLDEN=<name>` in its own Terraform workspace |
-| `provision`| Apply a lab profile (`PROFILE=`) to a running VM over SSH — installs tools/repos |
-| `ip` / `ssh` / `gui` / `smoke` | Print live IP / interactive session / launch a GUI app over X11 (`BINARY=`, default `BROWSER`) / non-interactive check |
-| `start` / `stop` / `reboot` / `restart` / `status` / `autostart` | VM lifecycle via `virsh` (all honour `VM=`) |
-| `snapshot` / `snapshots` / `revert` / `snapshot-delete` | Point-in-time snapshots (`SNAP=`, default `clean`) |
-| `data-create` / `data-delete` | Create / delete the persistent `/data` image `$(VM)-data.raw` (`DATA_GB=`) |
-| `apps-save` / `apps-restore` | Export / re-install the VM's package selection (survives a destroy+rebuild) |
-| `info` / `provenance` | Show a VM's provenance: libvirt description + live `/etc/kali-lab-build.json` |
-| `export` | Export a qcow2 (flatten+compress; `MAXSIZE=` to split, `PASSWORD=` to encrypt) |
-| `reset`  | Force-remove a VM's orphan libvirt domain/overlay/cloudinit (keeps `<vm>-data.raw`) |
-| `all`    | `bake → install → deploy → smoke` |
-| `destroy` / `clean` | Destroy `VM=<name>` (its workspace) / remove local build artifacts |
+### Disk space
 
-All VM-facing targets accept `VM=<name>` and resolve the live IP from libvirt, so
-they work on any deployed domain (not just the last one).
+Thin-provisioned `qcow2` overlays keep usage modest, but plan for:
 
-### Tunable variables (override on the command line)
+- **Golden image**: ~17–20 GiB allocated for a desktop golden (`kali-desktop`),
+  less for `kali-linux-headless`/`core`. Counted **once** — every VM overlays it.
+- **Per-VM root overlay**: a few GiB at first, grows with use. `full` wants a
+  **50 GiB** root (`make full` sets this); lighter profiles fit in 30 GiB.
+- **Persistent data disks** (`<vm>-data.raw`): sized by `DATA_GB` (sparse). A V8
+  build needs **≥ 40 GiB** (ext4 overhead: a 30 GiB disk only yields ~28 GiB free).
+- **Rule of thumb**: 80–120 GiB free for a handful of VMs plus one golden.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `META`    | `kali-linux-headless` | Kali metapackage to install |
-| `DESKTOP` | `false` | Bake a full XFCE desktop + lightdm (view via SPICE/virt-viewer) |
-| `GUI`     | `false` | Also bake the VNC session stack (x11vnc, xvfb, fluxbox) |
-| `GOLDEN`  | `kali-golden` | Pool volume name to install to / deploy from — lets several flavours coexist |
-| `VM`      | `kali-lab-01` | VM / libvirt domain name and Terraform workspace |
-| `VERBOSE` | `false` | Run Ansible with `-vvvv` |
-| `VARIANT` | `installer` | ISO flavour (`installer`, `installer-netinst`, `installer-everything`, `live`) |
-| `BROWSER` | `firefox-esr` | Browser launched by `make gui` |
-| `TF`      | `terraform` | IaC binary (`TF=tofu` to use OpenTofu) |
-| `POOL`    | `default` | libvirt storage pool name |
-| `SPICE`   | `true` | Apply the virtio/SPICE XSLT (virtio-gpu, clipboard/resize, virtiofs); needs `xsltproc`. `SPICE=false` for headless VMs |
-| `KBD`     | `fr` | Console + X11 keyboard layout baked into the golden |
-| `UPGRADE` | `true` | Run a full `apt upgrade` at bake time (patches the rolling release) |
-| `SHARE`   | `$(CURDIR)/shared` | Host dir shared into the guest over virtiofs at `/mnt/host`. `SHARE=` (empty) disables it |
-| `SHARE_TAG` | `hostshare` | virtiofs mount tag |
-| `SWAP`    | `2G` | cloud-init swap file size on first boot (no swap partition); `SWAP=` disables |
-| `PROFILE` | `research` | Lab profile (`provision/profiles/<name>.yml`) applied by `make provision` |
-| `DATA`    | `false` | `deploy DATA=true` attaches the persistent data disk on `/data` |
-| `DATA_GB` | `10` | Size of the data image created by `make data-create` |
-| `SRC`     | `$(VM)` | Source VM whose saved package list `apps-restore` re-installs |
-| `MEM` / `VCPU` / `DISK` | `4096` / `2` / `30` | RAM (MiB), vCPUs, root disk (GiB) for `deploy` |
-
-Example: `make bake GUI=true META=kali-linux-core VARIANT=installer-netinst`
-
-### GUI images and multiple flavours
-
-The GUI is decided at **bake** time, not at deploy — `deploy` just clones a golden.
-Use `GOLDEN=` to keep several named goldens in the pool and pick one per VM:
-
-```bash
-# a headless golden and a desktop golden, side by side
-make bake             GOLDEN=kali-headless && make install GOLDEN=kali-headless
-make bake DESKTOP=true GOLDEN=kali-desktop  && make install GOLDEN=kali-desktop
-
-# deploy different VMs from different goldens
-make deploy VM=attacker GOLDEN=kali-headless      # CLI only
-make deploy VM=desktop  GOLDEN=kali-desktop       # full XFCE
-virt-viewer -c qemu:///system desktop             # see the desktop (SPICE)
-```
-
-`DESKTOP=true` bakes a full XFCE desktop (shown by SPICE/`virt-viewer`); `GUI=true`
-bakes only the lightweight VNC stack for remote single-window use. They are
-independent. For an occasional GUI app without either, `make gui` uses SSH X11
-forwarding against a headless image.
-
-### Multiple VMs
-
-Each `deploy`/`destroy` uses a **Terraform workspace named after `VM=`**, so many
-VMs coexist, each in its own state, all backed by the (shared, read-only) golden.
-`virsh` sees every domain regardless of how it was created; the `ssh`/`gui`/
-`status`/`start`/`stop` targets target any of them by `VM=`.
+Inspect and reclaim at any time: **`make disk`** (read-only report) and
+**`make gc`** (interactive cleanup of old VMs / orphaned volumes).
 
 ---
 
-## Prerequisites (Debian/Ubuntu host)
+## 3. Installation
 
 ```bash
-sudo apt update
-sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients \
-                    virtinst bridge-utils genisoimage cpu-checker \
-                    python3-venv unzip curl xsltproc
-kvm-ok                                    # confirm hardware virtualization
-sudo usermod -aG libvirt,kvm "$USER"      # then log out / back in
-sudo virsh net-start default   ; sudo virsh net-autostart default
-sudo virsh pool-start default  ; sudo virsh pool-autostart default
+git clone <this-repo> kali-lab && cd kali-lab   # repo lives under MyVMHandler/
+
+make tools      # install Packer + Terraform system-wide (HashiCorp apt repo, sudo)
+make venv       # create ./venv and install Ansible from requirements.txt
+make hooks      # install the git pre-commit secret-leak guard (at the repo root)
+make check      # verify the toolchain + KVM/libvirt
+
+cp .env.example .env     # optional: per-host defaults (see Advanced usage)
 ```
 
-- **Packer** is required for `bake` and must be on `PATH` (install via `make tools`
-  or HashiCorp's apt repo).
-- **Terraform** is auto-installed into `./.bin` (no sudo) by `deploy` if missing;
-  or install system-wide with `make tools`.
-- **Ansible** lives in the project venv (`make venv`), so the Packer provisioner
-  finds `ansible-playbook` on `PATH`. `python3 -m venv` needs `python3-venv`.
-
-Run `make check` at any time to see what is present and what is missing, with the
-exact fix for each item.
+`make tools` is the only step that needs `sudo`; everything else talks to libvirt
+as your user (you must be in the `libvirt` group — log out/in after adding).
 
 ---
 
-## How it works
+## 4. Simple usage (with example)
 
-### 1. Resolve the ISO (never stale)
+The fastest path is the interactive menu — it lists actions, lets you pick an
+existing VM/profile, fills defaults from `.env`, shows the exact `make` command and
+runs it:
 
-`kali.pkr.hcl` ships a pinned ISO default, but Kali is a rolling release.
-`fetch-latest-iso.sh` (run by `make iso`, and automatically before `make bake`)
-reads Kali's published `SHA256SUMS`, resolves the current ISO name and hash, and
-writes `build/iso.auto.pkrvars.hcl`. Packer auto-loads any `*.auto.pkrvars.hcl`,
-so it overrides the pinned defaults — no manual editing.
+```bash
+make tui
+```
 
-### 2. Bake
+Or go straight to a one-shot, fully-tooled VM and open a shell:
 
-Packer's `qemu` builder boots the ISO, serves `preseed.cfg` over its built-in HTTP
-server, and drives the installer via a `boot_command`. After first boot, Packer
-connects over SSH and the Ansible provisioner installs the metapackage, adds the
-GUI bits, and generalizes the image. Output: `build/output-kali/kali-golden.qcow2`.
+```bash
+# Bake the golden once (only needed the first time, or to refresh tools):
+make bake DESKTOP=true KBD=fr        # ~20–40 min; produces the golden qcow2
+make install                         # import it into the libvirt pool
 
-### 3. Install
+# One command: data disk + 50 GiB root + SPICE + shared folder + the 'full' toolbox
+make full VM=lab
 
-`make install` uploads the golden qcow2 into the libvirt pool as `$(GOLDEN).qcow2`
-**via the libvirt API** (`virsh vol-create-as` + `vol-upload`) — no `sudo`, and the
-volume is owned by libvirt so there are no permission surprises later. This step is
-required before `deploy`, which backs each VM's disk onto that volume.
+# Work with it:
+make ssh VM=lab                      # interactive shell
+make gui VM=lab BINARY=ghidra        # launch a GUI app on your screen (SSH X11)
+make status VM=lab                   # state + IP
+make stop VM=lab                     # graceful shutdown
+```
 
-### 4. Deploy
+Any target's full help (parameters + example) is available inline:
 
-Terraform clones the golden image into a per-VM copy-on-write disk, builds a
-NoCloud cloud-init seed (hostname + your SSH public key), and defines the KVM
-domain. `make ip` prints the leased address; `make smoke` verifies SSH.
-
-Edit `deploy/terraform.tfvars` (copy from `terraform.tfvars.example`) to set
-`vm_name`, `memory_mb`, `vcpu`, `disk_gb`, and `ssh_public_key_path`.
+```bash
+make help              # one-line summary of every target
+make deploy help       # detailed help for a single target (also: make help deploy)
+```
 
 ---
 
-## Remote GUI access (headless VM)
+## 5. Advanced usage (with examples)
 
-The image is headless, so there is no local display. Two families of solution:
+### Per-host defaults with `.env`
 
-**X11 forwarding (lean, nothing extra to run):**
+`-include .env` is read before the variable defaults, so `.env` values win (via
+`?=`). Stop retyping `GOLDEN=`/`DISK=`/`VM=`:
 
-```bash
-ssh -Y kali@<vm-ip>
-firefox-esr            # window is forwarded to your screen
+```ini
+# .env
+GOLDEN=kali-desktop
+DISK=50
+VM=poste
 ```
 
-**VNC over an SSH tunnel (full session; needs `GUI=true` at bake time):**
+### Baking a custom golden
 
 ```bash
-ssh -L 5900:localhost:5900 kali@<vm-ip> \
-  "x11vnc -create -env FD_PROG=/usr/bin/fluxbox \
-          -env X11VNC_CREATE_GEOM=1280x800x24 -localhost -forever -nopw"
-# then point a VNC viewer at localhost:5900
+# A lean, SSH-only golden (fast, small) — override the metapackage:
+make bake META=kali-linux-core
+# A desktop golden with a French keyboard and no full upgrade:
+make bake DESKTOP=true KBD=fr UPGRADE=false
 ```
 
-> **Security:** never expose raw VNC/RDP on the network — always bind to loopback
-> and reach it through an SSH tunnel.
+### Deploying manually (fine-grained control)
 
-See §6 of the runbook for noVNC, xrdp/XFCE, and the SPICE console.
+```bash
+make data-create VM=rev DATA_GB=40                  # persistent /data (survives rebuilds)
+make deploy      VM=rev GOLDEN=kali-desktop DISK=50 DATA=true SPICE=true \
+                 SHARE="$HOME/Documents/project-x"  # virtiofs share on /mnt/host
+make provision   VM=rev PROFILE=full                # layer the full toolbox
+```
+
+### Layering profiles (they stack, idempotently)
+
+```bash
+make provision VM=rev PROFILE=full     # offensive toolkit + RE + AD + Ghidra + OpenCode
+make provision VM=rev PROFILE=v8       # then add a V8 checkout + d8 build on /data
+```
+
+### Growing a data disk in place (no rebuild, no Terraform drift)
+
+```bash
+make data-resize VM=rev DATA_GB=60     # online if the VM runs; grow-only
+```
+
+### Launch a set of GUI tools at the start of a work session
+
+```bash
+printf 'ghidra\nburpsuite\nwireshark\n' > work/rev.apps
+make work VM=rev                       # starts the VM, waits for SSH, X11-launches each
+```
+
+### Snapshots, provenance, export
+
+```bash
+make snapshot VM=rev SNAP=clean        # checkpoint (RAM included if running)
+make revert   VM=rev SNAP=clean
+make note     VM=rev MSG="triaged crash in /data/out"   # worklog in the libvirt description
+make info     VM=rev                                    # provenance (description + build manifest)
+make export   GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret   # portable, split, encrypted
+```
+
+### Cleanup
+
+```bash
+make disk                              # what is using space
+make gc                                # interactively reclaim old VMs / orphans
+make reset   VM=rev                    # remove the VM but keep its /data
+make destroy VM=rev                    # Terraform destroy (keeps the standalone data disk)
+```
 
 ---
 
-## Lab profiles (per-VM provisioning)
+## 6. Troubleshooting
 
-The golden stays lean and generic; each research task layers its own tools and
-configuration onto a **running** VM from a declarative profile
-(`provision/profiles/<name>.yml`), applied over SSH with Ansible — idempotent and
-re-runnable, no rebake:
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ssh: … REMOTE HOST IDENTIFICATION HAS CHANGED` | disposable VM reused an IP with a fresh host key | `ssh-keygen -f ~/.ssh/known_hosts -R <ip>` then retry (`make full`/`make work` purge it automatically) |
+| `error: externally-managed-environment` on a `pip install` | Kali Python is PEP 668 managed | install into a **venv** (the profiles already do); never use system `pip` |
+| `Moins de N GiB libres sur /` or `/data` | root/data too small, or ext4 overhead | `make data-resize` / redeploy with a bigger `DISK=` (a 30 GiB disk only yields ~28 GiB free) |
+| `golden 'X.qcow2' absent du pool` | `GOLDEN` doesn't match a baked image | `make install GOLDEN=<name>`, or set `GOLDEN=` in `.env` |
+| `SHARE` change not visible in `/mnt/host` | virtiofs is bound at domain **start** | `make restart VM=<vm>` after changing the share |
+| `No route to host` right after deploy | VM still booting / no DHCP lease yet | wait, re-check `make status`; the stale value is the last Terraform output |
+| `xsltproc: not found` on deploy | `SPICE=true` needs the XSLT transform | install `xsltproc`, or deploy with `SPICE=false` |
+| Ghidra/MCP build fails (`Could not find artifact ghidra:*`) | version-locked Maven build needs `GHIDRA_INSTALL_DIR` + local jars | best-effort by design — the rest of `full` still installs; finish the extension by hand |
+| Localised `virsh` output breaks a script | non-C locale (e.g. `en cours d'exécution`) | the helpers force `LC_ALL=C`; do the same in any new recipe |
 
-```bash
-make deploy    VM=poste GOLDEN=kali-desktop DATA=true
-make provision VM=poste PROFILE=research      # installs the profile's tools
-```
-
-A profile lists the packages and external repositories to set up. `provision/profiles/research.yml`:
-
-```yaml
-apt_packages: [ awscli, git, python3-pip, wireshark, tmux, jq ]
-apt_repos:
-  - name: vscode
-    key_url: https://packages.microsoft.com/keys/microsoft.asc
-    keyring: /etc/apt/keyrings/microsoft.gpg
-    repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
-    packages: [ code ]
-```
-
-Copy it to make your own (`provision/profiles/malware.yml`, `provision/profiles/pentest.yml`, …) and
-select with `PROFILE=`. The provisioning VM needs Internet, which it has via the
-libvirt NAT network.
-
-A profile can use any of these keys (all optional): `apt_packages`, `apt_repos`,
-`min_free_gb`/`min_free_path`, `directories`, `dns`, `host_binaries` (copied from
-the host — e.g. a proprietary IDA installer or analysis samples), `downloads`
-(fetched into the VM, optionally extracted — e.g. Ghidra), `git_repos`, `env_path`,
-`openvpn` (import a `.ovpn` and enable the client), `vpn_killswitch` (fail-closed
-nftables firewall so a dropped tunnel never leaks the public IP), `docker_run`
-(install Docker and run containers), and `run_commands` (build steps).
-`provision/site.yml` documents each.
-
-Ready-made profiles: `research` (dev + VS Code), `v8` (build the V8 engine),
-`pentest` (offensive toolkit), `cibles` (vulnerable web targets in Docker — DVWA,
-WebGoat, Juice Shop). For a lab, deploy the attacker box and the targets as
-**separate VMs**:
-
-```bash
-make deploy VM=attaquant GOLDEN=kali-desktop DATA=true && make provision VM=attaquant PROFILE=pentest
-make deploy VM=cibles    GOLDEN=kali-desktop         && make provision VM=cibles    PROFILE=cibles
-# from the attacker VM/host: http://<cibles-ip>:8080 (DVWA), :8081/WebGoat, :3000 (Juice Shop)
-```
-
-### V8 build profile
-
-`provision/profiles/v8.yml` checks out and compiles V8 on the **persistent /data disk** (so it
-survives destroy/redeploy), after asserting at least 30 GiB free:
-
-```bash
-make data-create VM=v8 DATA_GB=30
-make deploy      VM=v8 GOLDEN=kali-desktop DATA=true
-make provision   VM=v8 PROFILE=v8        # depot_tools → fetch v8 → build d8 (long)
-# result: /data/v8/out/x64.release/d8 --version
-```
-
-It clones depot_tools, runs `fetch v8`, `install-build-deps.sh`, then
-`tools/dev/gm.py x64.release d8`. Steps are guarded (`creates:`) so re-running
-resumes rather than restarting. The fetch and build are large and CPU-heavy —
-give the VM several cores/GB (`MEM=`/`VCPU=` at deploy).
-
-## Exporting an image (`make export`)
-
-Produce a portable copy of a golden (or any pool volume) to move to another host or
-hand to students. It flattens the backing chain into a **standalone** qcow2
-(`qemu-img convert` — no dependency on the golden), then compresses, and optionally
-splits and/or encrypts:
-
-```bash
-make export GOLDEN=kali-desktop                              # one compressed .qcow2 in ./export
-make export GOLDEN=kali-desktop MAXSIZE=2G                   # + split into 2 GiB parts
-make export GOLDEN=kali-desktop MAXSIZE=2G PASSWORD=s3cret   # AES-256 7z volumes (encrypted headers)
-make export IMG=poste.qcow2 OUT=/media/usb                  # any pool volume, chosen output dir
-```
-
-Tunables: `IMG` (pool volume, default `$(GOLDEN).qcow2`), `OUT` (dir, default `./export`),
-`MAXSIZE` (e.g. `2G` — omit for no split), `PASSWORD` (omit for no encryption),
-`EXPORT_NAME` (base name, default `<img>-<date>`). A `.sha256` of the parts is written.
-Rebuild: plain split → `cat NAME.qcow2.part-* > NAME.qcow2`; encrypted → `7z x NAME.7z`
-(joins volumes and prompts for the password). `7z` needs `p7zip-full`.
-
-## Provenance and persistence
-
-Two related needs when you rebuild lab VMs onto a newer Kali: **know exactly what
-an image is**, and **keep the data/apps that must outlive a rebuild**.
-
-### Build manifest (what OS + patch level is this?)
-
-Every bake writes `/etc/kali-lab-build.json` inside the golden, recording the OS
-distribution/version, kernel, how many packages were still upgradable at bake time
-(the *update level*), whether a full upgrade was applied, the source ISO + its
-SHA-256, the flavour (metapackage + desktop/VNC flags), the build date, and the
-pipeline git commit. Packer then downloads the file to `build/manifests/`, and
-Terraform folds a one-line summary into the libvirt domain `<description>` at
-deploy time. Read it back any time:
-
-```bash
-make info VM=attacker          # libvirt description + live guest manifest (pretty JSON)
-virsh -c qemu:///system desc attacker
-ssh kali@<vm-ip> cat /etc/kali-lab-build.json
-```
-
-The manifest travels *with the image*, so a VM cloned from a golden months ago
-still tells you precisely which build it came from.
-
-### Persistent data disk (`DATA=true`)
-
-A VM's root disk is a disposable copy-on-write overlay — `make destroy` deletes it.
-To keep files across a destroy + rebuild (e.g. moving to a newer Kali), attach a
-**separate data disk** that Terraform does *not* own:
-
-```bash
-make data-create VM=attacker DATA_GB=20     # once — creates attacker-data.raw in the pool
-make deploy      VM=attacker DATA=true       # attaches it; cloud-init mounts it on /data
-# ... work, save everything under /data ...
-make destroy     VM=attacker                 # removes the domain + root overlay ONLY
-make bake ... && make install GOLDEN=...      # newer golden
-make deploy      VM=attacker DATA=true GOLDEN=<newer>   # /data comes back intact
-```
-
-Why it survives: the image is a standalone raw volume created out-of-band by
-`data-create`, attached *by path*. Terraform manages only the domain and the root
-overlay, so `destroy` never touches it. cloud-init formats it **once**
-(`overwrite: false`) and mounts it by filesystem **label** (`LABEL=labdata`, with
-`nofail`), so device ordering and an absent disk are both handled. Delete it
-explicitly — and lose its contents — with `make data-delete VM=attacker`.
-
-> Attach/detach happens through the Terraform apply that `make deploy` runs, so
-> change the data disk via destroy+deploy rather than re-`apply`-ing a live VM.
-
-### Shared folder vs data disk
-
-Two different mechanisms, often confused:
-
-- **`/data` (data disk, `DATA=true`)** — a virtual **disk that belongs to the VM**
-  (ext4 on `<vm>-data.raw`). It persists across destroy/rebuild but the host does
-  not mount its contents. Use it for state that must live *inside* the VM.
-- **`/mnt/host` (virtiofs, `SHARE=`)** — a **host directory mounted live inside the
-  guest**, like VirtualBox shared folders. Files written on either side appear on
-  the other immediately. Use it to exchange files with the host.
-
-virtiofs is on by default (`SHARE=$(CURDIR)/shared`, created automatically). It
-needs `SPICE=true` (the XSLT injects the `virtiofs` driver and the shared-memory
-backing the guest requires) and a working `virtiofsd` on the host (shipped with
-modern libvirt/QEMU). Disable it with `SHARE=` (empty), or point it elsewhere:
-
-```bash
-make deploy VM=poste GOLDEN=kali-desktop SHARE=/srv/labfiles   # share a specific dir
-make deploy VM=poste GOLDEN=kali-desktop SHARE=                 # no share
-# in the guest: files under /mnt/host are the host's SHARE directory, live
-```
-
-### Application backup (`apps-save` / `apps-restore`)
-
-`/data` keeps files, not the set of installed packages. To carry the **installed
-applications** across a rebuild, snapshot the package selection and replay it:
-
-```bash
-make apps-save    VM=attacker                 # → build/apps/attacker.{selections,manual}
-# ... destroy, redeploy onto a newer golden ...
-make apps-restore VM=attacker SRC=attacker     # apt-mark showmanual → apt-get install
-```
-
-`apps-save` records both the full `dpkg --get-selections` and the explicit
-(`apt-mark showmanual`) list; `apps-restore` re-installs the explicit list with
-`apt-get`, which resolves current versions on the new base — more robust across a
-rolling-release bump than pinning exact versions. Combine the three: manifest for
-*what it is*, data disk for *files*, app backup for *installed tools*.
+`make check` and `make status VM=<vm>` are the first things to run when something
+looks wrong.
 
 ---
 
-## Troubleshooting
+## 7. Known limitations
 
-Lessons learned building this pipeline — each is a common Kali/Packer/libvirt gotcha.
-
-- **`ansible-playbook: not found` during `bake`** — the Packer provisioner needs
-  Ansible on `PATH`. Run `make venv`; `bake`/`validate` activate it automatically.
-- **`terraform: command not found`** — `make deploy` auto-installs Terraform into
-  `./.bin`. For a system-wide install use `make tools`.
-- **Installer stalls on the language screen** — the `boot_command` keystrokes were
-  swallowed before the boot menu was ready. `boot_wait` is 15 s and locale/keymap
-  are passed as kernel params; watch the VNC that Packer prints to confirm.
-- **Packer stuck at "Waiting for SSH", `connection reset by peer`** — Kali ships
-  `openssh-server` **disabled** by default (unlike Debian). The preseed
-  `late_command` runs `systemctl enable ssh` so the installed image starts sshd at
-  boot. Transient resets right after boot are normal while sshd comes up.
-- **Ansible fails on `Restart ssh`** — restarting sshd after the host keys were
-  removed during generalization fails. There is no restart handler by design;
-  X11Forwarding applies at next boot and cloud-init regenerates the host keys.
-- **Terraform: "An argument named `source` is not expected here"** — the libvirt
-  provider **v0.9 changed the schema**. The provider is pinned to `~> 0.8.0`;
-  `deploy` runs `init -upgrade` so the pin takes effect over any stale lock.
-- **Terraform: "no such file … kali-golden.qcow2"** — the golden image is not in
-  the pool. Run `make install` (after `make bake`). `deploy` now checks for it first.
-- **`make check` says libvirt/pool inactive but it works** — modern libvirt uses
-  socket-activated modular daemons; `check` tests real connectivity, not the
-  systemd unit state. Ground truth: `virsh -c qemu:///system list --all`.
-- **Domain fails to start: "Could not open … .qcow2: Permission denied"** — on
-  `qemu:///system`, libvirt's **dynamic ownership** relabels the disk chain at
-  start and chowns the *shared backing file* (the golden) to `root:root 0600`
-  for the run, so QEMU (running as `libvirt-qemu`) can no longer read it — even
-  though the file is `0644` at rest (dmacvicar/libvirt issue #546). No AppArmor
-  `DENIED` line appears because it is a DAC issue, not MAC. Recommended fix
-  (keeps AppArmor): disable just the relabel in `/etc/libvirt/qemu.conf` with
-  `dynamic_ownership = 0`, then restart `virtqemud`/`libvirtd`; the golden stays
-  `libvirt-qemu`-readable. Blunt alternative: `security_driver = "none"` (drops
-  QEMU confinement host-wide — avoid on a hardened host). After changing either,
-  `virsh undefine <vm>` any orphan domain and re-run `make deploy`.
-- **Domain create fails: "domain '…' already exists with uuid …"** — a previous
-  failed `apply` defined the domain in libvirt but Terraform did not record it
-  (state drift). Remove the orphan with `virsh -c qemu:///system undefine <vm>`
-  (add `--nvram` if asked), then `make deploy`.
-- **Deploy fails: `error applying XSLT stylesheet: exec: "xsltproc": executable file not found`** —
-  the SPICE integration (`deploy/spice.xsl`, applied via `xml { xslt }`) is applied
-  by the provider by shelling out to `xsltproc`, which is not installed. Either
-  `sudo apt install -y xsltproc` (needed for the desktop clipboard/resize), or skip
-  the block for headless VMs with `make deploy … SPICE=false`. The root overlay and
-  cloud-init disk are created before the domain, so a re-run only creates the domain
-  — no cleanup needed.
-- **Deploy fails or the share won't mount with `SHARE=`** — virtiofs needs (1)
-  `SPICE=true` so the XSLT injects the `virtiofs` driver + shared-memory backing
-  (`make deploy` refuses `SHARE=` with `SPICE=false`), and (2) a `virtiofsd`
-  binary on the host (from the `qemu-system` / libvirt packages). Check the guest
-  with `mount | grep /mnt/host` and `dmesg | grep -i virtiofs`; disable the share
-  with `SHARE=` if not needed.
-- **Disk full** — Packer caches the ISO in `~/.cache/packer` and never deletes it.
-  Clear with `rm -rf ~/.cache/packer/*`, or set `PACKER_CACHE_DIR` to another disk.
+- **Pinned upstream URLs can break.** External assets (the Kali ISO, OpenCode/Claude
+  installers, Ghidra releases) are fetched by URL. Dated release assets are the most
+  fragile — Ghidra's `ghidra_<ver>_PUBLIC_<YYYYMMDD>.zip` filename changes per build,
+  so it is now **resolved at provision time via the GitHub API** rather than pinned;
+  other URLs may still need updating when upstream moves them.
+- **GitHub API rate limit.** Unauthenticated resolution (Ghidra) is capped at ~60
+  requests/hour per IP — irrelevant for occasional provisioning, but noticeable in CI.
+- **The ghidra-mcp integration is a community, version-locked build.** Its Maven
+  build depends on Ghidra's jars and the exact Ghidra version; it runs **best-effort**
+  so it never blocks the rest of `full`, but may need manual finishing.
+- **Manual root-disk resize causes Terraform drift.** The root volume is TF-managed;
+  resizing it outside `make deploy DISK=` makes state disagree with reality. (The
+  *data* disk is **not** TF-managed, so `make data-resize` is drift-free.)
+- **Single-user, single-host, x86_64 assumptions.** The golden is amd64; `/data` is
+  the second virtio disk (`/dev/vdb`, whole-device ext4); the Ghidra install is
+  `chown`ed to the `kali` user; the share mounts at `/mnt/host`. Multi-user or ARM
+  hosts would need changes.
+- **No secrets in the repo, by design.** API keys and VPN profiles are configured
+  per-VM at runtime (`opencode auth login`, an imported `.ovpn`), never versioned;
+  the pre-commit hook refuses to commit them.
+- **virtiofs requires shared memory.** `SHARE` needs `SPICE=true` (memfd backing);
+  changing the share needs a VM restart (device bound at boot).
 
 ---
 
-## Notes
+## 8. Code structure
 
-- **Rebuild vs redeploy** — the whole point of "bake once": after the golden image
-  exists, `make deploy` never touches the installer again. Re-bake only to patch
-  the rolling release (consider a scheduled CI job).
-- **OpenTofu** — pass `TF=tofu` to use the open-source Terraform fork instead;
-  the HCL and provider are identical (auto-install covers `terraform` only).
-- **Lab networking** — VMs attach to the libvirt `default` network (NAT,
-  192.168.122.0/24). For isolated exercises, define a dedicated libvirt network per lab.
+```
+MyVMHandler/                     # git repo root (the pre-commit hook lives here)
+└── kali-lab/
+    ├── Makefile                 # the orchestrator — every workflow is a target
+    ├── tui.py                   # dependency-free interactive menu over the Makefile
+    ├── requirements.txt         # Ansible (installed into ./venv by `make venv`)
+    ├── .env.example             # copy to .env for per-host variable overrides
+    ├── README.md                # this file
+    ├── kali-packer-ansible-terraform-lab.md   # companion runbook / rationale
+    │
+    ├── build/                   # STAGE 1 — bake the golden
+    │   ├── kali.pkr.hcl         # Packer qemu builder + Ansible provisioner
+    │   ├── fetch-latest-iso.sh  # resolves the current Kali ISO (→ iso.auto.pkrvars.hcl)
+    │   ├── http/preseed.cfg     # unattended Debian/Kali installer (single growable root)
+    │   ├── ansible/playbook.yml # what goes into the golden (metapkg, cloud-init, desktop…)
+    │   ├── ansible/templates/   # kali-lab-build.json.j2 — the provenance manifest
+    │   ├── manifests/           # generated build manifests (gitignored)
+    │   └── apps/                # apps-save/restore package lists (gitignored)
+    │
+    ├── deploy/                  # STAGE 2 — deploy a VM
+    │   ├── main.tf              # libvirt_volume + libvirt_domain + cloud-init
+    │   ├── variables.tf         # all deploy knobs (memory, vcpu, disk, data, share…)
+    │   ├── outputs.tf           # the VM IP
+    │   ├── cloud_init.yaml.tftpl# user, SSH key, swap, /data + /mnt/host mounts
+    │   ├── spice.xsl            # injects virtio-gpu + memfd + virtiofs + USB tablet
+    │   └── terraform.tfvars.example
+    │
+    ├── provision/               # STAGE 3 — layer tools onto a running VM
+    │   ├── site.yml             # the one playbook; consumes a profile's variables
+    │   ├── profiles/            # declarative tool sets:
+    │   │   ├── research.yml     #   dev + VS Code + Ghidra + OpenCode
+    │   │   ├── pentest.yml      #   offensive toolkit
+    │   │   ├── ad.yml           #   Active Directory tooling (impacket, netexec, bloodhound)
+    │   │   ├── cibles.yml       #   vulnerable targets (DVWA, Juice Shop, …)
+    │   │   ├── v8.yml           #   V8 checkout + d8 build on /data
+    │   │   └── full.yml         #   everything above + Claude Code + Ghidra↔OpenCode MCP
+    │   └── files/opencode.json  # multi-provider OpenCode config (NO secrets)
+    │
+    ├── scripts/disk-gc.sh       # the engine behind `make disk` / `make gc`
+    ├── work/                    # `make work` app lists (work/<vm>.apps; gitignored)
+    └── .githooks/pre-commit     # blocks committing .ovpn/keys/.env/API-key-looking diffs
+```
 
-## References
+**How the pieces connect:** `Makefile` targets call Packer (build), Terraform
+(deploy, one workspace per VM), and Ansible (`provision/site.yml` with a profile's
+vars). `tui.py` only *drives* the Makefile — it never reimplements logic, so the two
+cannot drift.
 
-- Packer QEMU builder — <https://developer.hashicorp.com/packer/integrations/hashicorp/qemu>
-- Packer Ansible provisioner — <https://developer.hashicorp.com/packer/integrations/hashicorp/ansible>
-- Terraform libvirt provider (dmacvicar) — <https://registry.terraform.io/providers/dmacvicar/libvirt>
-- Debian preseeding — <https://www.debian.org/releases/stable/amd64/apb.html>
-- Kali metapackages — <https://www.kali.org/docs/general-use/metapackages/>
-- cloud-init NoCloud datasource — <https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html>
-- cloud-init disk setup / mounts — <https://cloudinit.readthedocs.io/en/latest/reference/modules.html#disk-setup>
-- `dpkg` selections & `apt-mark` — <https://manpages.debian.org/bookworm/dpkg/dpkg.1.en.html> · <https://manpages.debian.org/bookworm/apt/apt-mark.8.en.html>
-- libvirt domain XML (disks, description) — <https://libvirt.org/formatdomain.html>
+---
+
+## 9. Contributing
+
+- **Conventions**: comments and docs in **English**; keep the Makefile the single
+  source of truth and let `tui.py` wrap it.
+- **Adding a workflow** = one Makefile target with a `## summary`, optional `#:`
+  detail lines (shown by `make <target> help`), an entry in `.PHONY`, and — if it is
+  menu-worthy — one line in `tui.py`'s `ACTIONS` table.
+- **Ansible must stay idempotent**: guard long steps with `creates:`, prefer
+  declarative profile variables over bespoke tasks, and keep system deps in
+  `apt_packages` (not ad-hoc installs). Force `LC_ALL=C` around any `virsh` parsing.
+- **Never commit secrets.** Run `make hooks` once; the pre-commit guard blocks
+  `.ovpn`, private keys, `.env`, OpenCode auth stores and API-key-looking diffs.
+  Configure keys per-VM at runtime.
+- **Validate before a PR**: `make validate` (packer + terraform validate) and
+  `make check` (toolchain). Test a target end-to-end on a throwaway VM.
+- Keep upstream URLs resilient (resolve dated assets at runtime where possible) and
+  document any new external dependency under *Known limitations*.
+
+---
+
+## 10. Open-source alternatives
+
+This project is deliberately small and single-host. Depending on your goal, these
+established tools may fit better:
+
+- **Vagrant** + **vagrant-libvirt** — the classic VM-definition workflow; broader
+  provider support, larger ecosystem. <https://www.vagrantup.com/> ·
+  <https://github.com/vagrant-libvirt/vagrant-libvirt>
+- **Ludus** — opinionated, API-driven cyber-range builder on Proxmox, with ready
+  ranges and templates. <https://ludus.cloud/>
+- **GOAD (Game of Active Directory)** — pre-built vulnerable AD labs (Vagrant +
+  Ansible). <https://github.com/Orange-Cyberdefense/GOAD>
+- **DetectionLab** — a Windows/AD detection-engineering lab across several providers.
+  <https://github.com/clong/DetectionLab>
+- **SecGen** — randomised, scenario-based vulnerable VM generator (Ruby + Vagrant +
+  Puppet). <https://github.com/cliffe/SecGen>
+- **vulhub** — Docker-Compose images of specific CVEs (comparable to the `cibles`
+  profile). <https://github.com/vulhub/vulhub>
+- **Kali official images** — prebuilt VM/cloud/WSL images when you don't need a
+  custom bake. <https://www.kali.org/get-kali/>
+
+`kali-lab`'s niche: a *transparent*, dependency-light, **libvirt-native** bake→deploy
+pipeline you can read end-to-end in a single `Makefile`, tuned for teaching and for
+Kali specifically.
+
+---
+
+## Glossary
+
+- **KVM** — Kernel-based Virtual Machine (Linux hardware virtualisation).
+- **QEMU** — the emulator/hypervisor that runs the VMs.
+- **libvirt / virsh** — virtualisation management API and its CLI.
+- **qcow2** — QEMU Copy-On-Write v2 disk format (thin overlays, snapshots).
+- **IaC** — Infrastructure as Code (Packer/Ansible/Terraform here).
+- **golden image** — the baked, reusable base disk cloned per VM.
+- **cloud-init / NoCloud** — first-boot configuration via a local ISO.
+- **virtiofs** — paravirtualised host↔guest shared filesystem (`/mnt/host`).
+- **SPICE** — remote-display protocol (clipboard, dynamic resolution).
+- **MCP** — Model Context Protocol (Ghidra↔OpenCode bridge in the `full` profile).
+- **PEP 668** — Python rule requiring a venv on "externally managed" systems.
+- **TUI** — Text User Interface (`tui.py`).
+```

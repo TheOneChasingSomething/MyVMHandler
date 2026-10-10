@@ -119,7 +119,7 @@ help:
 	@echo
 else
 
-.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-delete apps-save apps-restore info provenance disk gc note export
+.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-resize data-delete apps-save apps-restore info provenance disk gc note export
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -461,9 +461,9 @@ destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
 data-create: ## Create the persistent data image $(VM)-data.raw (DATA_GB=)
 #: Detail  : creates the persistent data image <VM>-data.raw (raw, sparse), mounted
 #:           at /data and kept across destroy/redeploy. If it already exists it is
-#:           kept (to enlarge it use vol-resize, not this target).
+#:           kept (to enlarge it use `make data-resize`, not this target).
 #: Params  : VM=<name>  DATA_GB=<GiB>
-#: Example : make data-create VM=v8 DATA_GB=30
+#: Example : make data-create VM=v8 DATA_GB=40
 	@if virsh -c qemu:///system vol-info --pool $(POOL) $(VM)-data.raw >/dev/null 2>&1; then \
 	  echo ">> '$(VM)-data.raw' existe déjà — conservé (les données sont préservées)"; \
 	else \
@@ -471,6 +471,33 @@ data-create: ## Create the persistent data image $(VM)-data.raw (DATA_GB=)
 	  echo ">> Disque de données créé : $(POOL)/$(VM)-data.raw ($(DATA_GB) GiB, raw, sparse)"; \
 	fi
 	@echo "   Déploie avec :  make deploy VM=$(VM) DATA=true   (monté sur /data)"
+
+data-resize: ## Grow the persistent data disk to DATA_GB (online if the VM runs; never shrinks)
+#: Detail  : enlarges the standalone data volume <VM>-data.raw. It is NOT managed by
+#:           Terraform, so growing it creates no drift. Running VM → blockresize (live)
+#:           then `resize2fs /dev/vdb` over SSH; stopped VM → vol-resize, then grow the
+#:           fs by hand on next boot. Grow-only: a DATA_GB <= current size is refused.
+#: Params  : VM=<name>  DATA_GB=<new size GiB>
+#: Example : make data-resize VM=kali-lab-01 DATA_GB=40
+	@vol="$(VM)-data.raw"; \
+	  cur=$$(LC_ALL=C virsh -c qemu:///system vol-info --bytes --pool $(POOL) $$vol 2>/dev/null | awk '/Capacity/{print $$2}'); \
+	  [ -n "$$cur" ] || { echo "[!] '$$vol' introuvable — 'make data-create VM=$(VM)' d'abord"; exit 1; }; \
+	  new=$$(( $(DATA_GB) * 1073741824 )); \
+	  [ "$$new" -gt "$$cur" ] || { echo "[!] DATA_GB=$(DATA_GB) <= taille actuelle ($$((cur/1073741824)) GiB) — data-resize n'agrandit que (jamais de rétrécissement)"; exit 1; }; \
+	  dpath=$$(virsh -c qemu:///system vol-path --pool $(POOL) $$vol); \
+	  state=$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null); \
+	  if [ "$$state" = "running" ]; then \
+	    echo ">> blockresize $(VM) → $(DATA_GB)G (live)"; \
+	    virsh -c qemu:///system blockresize $(VM) "$$dpath" $(DATA_GB)G; \
+	    $(LIVE_IP); \
+	    if [ -n "$$ip" ]; then \
+	      ssh -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip 'sudo resize2fs /dev/vdb' && echo ">> /data agrandi à $(DATA_GB) GiB"; \
+	    else echo "   [i] dans la VM, termine avec : sudo resize2fs /dev/vdb"; fi; \
+	  else \
+	    echo ">> vol-resize $(POOL)/$$vol → $(DATA_GB)G (VM éteinte)"; \
+	    virsh -c qemu:///system vol-resize --pool $(POOL) $$vol $(DATA_GB)G; \
+	    echo "   [i] démarre la VM puis : sudo resize2fs /dev/vdb"; \
+	  fi
 
 data-delete: ## Delete the persistent data image (DESTROYS the /data content)
 	virsh -c qemu:///system vol-delete --pool $(POOL) $(VM)-data.raw

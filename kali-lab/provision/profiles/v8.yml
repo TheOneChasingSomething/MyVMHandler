@@ -1,16 +1,22 @@
 # V8 build profile — checks out and compiles V8 on the persistent /data disk.
 #
-# PREREQS (the /data disk must be >= 30 GiB and mounted):
-#   make data-create VM=v8 DATA_GB=30
+# PREREQS (the /data disk must be mounted; create it at >= 40 GiB):
+#   make data-create VM=v8 DATA_GB=40
 #   make deploy      VM=v8 GOLDEN=kali-desktop DATA=true
 #   make provision   VM=v8 PROFILE=v8            # this file (long: fetch + build)
+# Already have a smaller /data? Grow it in place:  make data-resize VM=v8 DATA_GB=40
+#
+# NB on sizing: ext4 overhead + the 5% reserved blocks mean a nominal 30 GiB disk
+# only exposes ~28 GiB free — so DATA_GB must exceed min_free_gb below by a few GiB.
+# 40 GiB gives ~37 GiB free, a comfortable margin for a V8 checkout + d8 build.
 #
 # Everything lives under /data so it survives destroy/redeploy onto a newer golden.
 # depot_tools + gclient run as the SSH user (never root); install-build-deps needs
 # root and runs via sudo. Steps are guarded (creates:) so re-running resumes.
 
-# Fail fast if the data disk is too small for a V8 checkout + build.
-min_free_gb: 30
+# Fail fast if the data disk is too small for a V8 checkout + build. Keep this a
+# few GiB below the real disk size (see the ext4-overhead note above).
+min_free_gb: 25
 min_free_path: /data
 
 # Base tools; depot_tools' install-build-deps.sh pulls the full toolchain.

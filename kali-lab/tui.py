@@ -157,6 +157,8 @@ ACTIONS: list[Action] = [
     ("12", "Reclaim disk space (interactive)", "gc", [], True),
     ("13", "Create persistent data disk", "data-create",
         [p_vm, p_text("DATA_GB", "size GiB", default_of("DATA_GB", "10"))], False),
+    ("13r", "Grow the data disk (online, never shrinks)", "data-resize",
+        [p_vm, p_text("DATA_GB", "new size GiB", default_of("DATA_GB", "40"))], True),
     ("14", "Take a snapshot", "snapshot", [p_vm, p_text("SNAP", "snapshot name", "clean")], True),
     ("15", "Revert to a snapshot", "revert", [p_vm, p_text("SNAP", "snapshot name", "clean")], True),
     ("16", "Show provenance / build info", "info", [p_vm], False),
