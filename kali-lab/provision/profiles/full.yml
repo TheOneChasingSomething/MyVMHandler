@@ -15,6 +15,7 @@ apt_packages:
   - curl
   - pipx
   - python3-pip
+  - python3-venv          # ghidra-mcp setup runs pip inside a venv (PEP 668)
   - openjdk-21-jdk        # Ghidra
   - awscli
   - wireshark
@@ -60,6 +61,7 @@ apt_repos:
     repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/code stable main"
     packages:
       - code
+      - code-insiders
 
 # NB: Ghidra is NOT fetched via `downloads:` — the release asset's filename
 # carries a per-build date stamp (ghidra_12.0.4_PUBLIC_<YYYYMMDD>.zip) that is
@@ -108,6 +110,11 @@ run_commands:
     become: true
   - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
     become: true
+  # The GhidraMCP extension deploys into the install's Extensions/Ghidra dir, but
+  # Ghidra was unzipped as root. Give the kali user the install (single-user lab
+  # VM) so the deploy, run as kali, can write there.
+  - cmd: "chown -R kali:kali $(ls -d /opt/ghidra_*_PUBLIC | head -1)"
+    become: true
   - cmd: "pipx ensurepath"
     become: false
   - cmd: "curl -fsSL https://opencode.ai/install | bash"
@@ -128,17 +135,33 @@ run_commands:
     become: false
     creates: "/home/kali/.local/bin/bloodhound-python"
   # ---- Ghidra <-> OpenCode via MCP (per the MIGINC/ghidra-mcp README) --------
-  # Validate the Ghidra path and install the extension's build prereqs (apt deps
-  # need root). The ghidra path is resolved from the unarchived 12.0.4 directory.
-  - cmd: "python3 -m tools.setup preflight --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && python3 -m tools.setup ensure-prereqs --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && touch /home/kali/.ghidra-mcp.prereqs"
+  # Kali's system Python is PEP 668 "externally-managed", so the setup's pip step
+  # is run inside a dedicated venv (never system pip, never root). Java/Maven/unzip
+  # come from apt_packages above; the ghidra path is the unarchived 12.0.4 dir.
+  - cmd: >-
+      test -x .venv/bin/python || python3 -m venv .venv ;
+      .venv/bin/python -m pip install --upgrade pip &&
+      .venv/bin/python -m tools.setup preflight --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) &&
+      .venv/bin/python -m tools.setup ensure-prereqs --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) &&
+      touch /home/kali/.ghidra-mcp.prereqs ||
+      { echo "[warn] ghidra-mcp prereqs step failed (non-fatal); the rest of the full profile is unaffected." ; true ; }
     chdir: /home/kali/tools/ghidra-mcp
-    become: true
+    become: false
     creates: /home/kali/.ghidra-mcp.prereqs
-  # Build the extension and deploy it into the kali user's Ghidra profile. The
-  # MCP bridge (bridge_mcp_ghidra.py) is then launched by OpenCode via the `mcp`
-  # block in provision/files/opencode.json. Start the server inside Ghidra with
-  # Tools -> GhidraMCP -> Start MCP Server (default port 8089), then `opencode mcp list`.
-  - cmd: "python3 -m tools.setup build && python3 -m tools.setup deploy --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) && touch /home/kali/.ghidra-mcp.deployed"
+  # Build + deploy the extension into the kali user's Ghidra profile, same venv.
+  # GHIDRA_INSTALL_DIR must point at the Ghidra install: its jars are NOT on Maven
+  # Central, so without it the build fails with "Could not find artifact ghidra:*".
+  # This step is best-effort: the GhidraMCP Maven build is a version-locked, third
+  # party build, so a failure here only warns and never blocks the rest of 'full'
+  # (no marker is written, so a later provision retries it). OpenCode's mcp entry
+  # is already in place; the bridge works once the extension is built.
+  # In Ghidra once built: Tools -> GhidraMCP -> Start MCP Server (port 8089).
+  - cmd: >-
+      GHIDRA="$(ls -d /opt/ghidra_*_PUBLIC | head -1)" ;
+      GHIDRA_INSTALL_DIR="$GHIDRA" .venv/bin/python -m tools.setup build &&
+      .venv/bin/python -m tools.setup deploy --ghidra-path "$GHIDRA" &&
+      touch /home/kali/.ghidra-mcp.deployed ||
+      { echo "[warn] GhidraMCP extension build/deploy failed (version-locked Maven build). The rest of the full profile is installed; finish the extension manually per the ghidra-mcp README (it needs GHIDRA_INSTALL_DIR and the Ghidra jars in the local Maven repo)." ; true ; }
     chdir: /home/kali/tools/ghidra-mcp
     become: false
     creates: /home/kali/.ghidra-mcp.deployed

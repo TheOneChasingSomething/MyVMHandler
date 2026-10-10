@@ -33,7 +33,7 @@
   "mcp": {
     "ghidra": {
       "type": "local",
-      "command": ["python3", "/home/kali/tools/ghidra-mcp/bridge_mcp_ghidra.py"],
+      "command": ["/home/kali/tools/ghidra-mcp/.venv/bin/python", "/home/kali/tools/ghidra-mcp/bridge_mcp_ghidra.py"],
       "enabled": true,
       "timeout": 10000
     }
