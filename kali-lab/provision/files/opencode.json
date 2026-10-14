@@ -1,5 +1,16 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@devtheops/opencode-plugin-otel@1.5.1",
+      {
+        "enabled": true,
+        "endpoint": "http://localhost:4317",
+        "protocol": "grpc",
+        "resourceAttributes": "openinference.project.name=Opencode"
+      }
+    ]
+  ],  
   "provider": {
     "anthropic": {
       "models": {
@@ -33,10 +44,19 @@
   "mcp": {
     "ghidra": {
       "type": "local",
-      "command": ["/home/kali/tools/ghidra-mcp/.venv/bin/python", "/home/kali/tools/ghidra-mcp/bridge_mcp_ghidra.py"],
+      "command": ["/home/kali/tools/ghidra-mcp/.venv/bin/python", "-m", "bridge_mcp_ghidra"],
       "enabled": true,
       "timeout": 10000
     }
   },
-  "model": "anthropic/claude-sonnet-4-5"
-}
+  "model": "openai/gpt-6.1-sol",
+  "agent": {
+    "build": {
+      "model": "openai/gpt-6.1-sol",
+      "variant": "max"
+    },
+    "plan": {
+      "model": "openai/gpt-6.1-sol",
+      "variant": "max"
+    }
+  }}

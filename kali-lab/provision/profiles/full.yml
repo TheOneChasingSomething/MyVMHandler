@@ -1,7 +1,9 @@
 # Full toolbox profile — everything from research + pentest + ad in one VM.
 #   make provision VM=<vm> PROFILE=full
-# Heavy: desktop dev tools + the offensive toolkit + AD tooling + Ghidra 12.0.4 +
+# Heavy: desktop dev tools + the offensive toolkit + AD tooling + Ghidra 12.1.4 +
 # OpenCode + Claude Code, with Ghidra wired to OpenCode over MCP (ghidra-mcp).
+# NB: Ghidra is pinned to 12.1.4 because that is the version bethington/ghidra-mcp
+# currently builds against (its API differs from 12.0.4); keep the two in sync.
 # NOT included: the vulnerable targets (profile 'cibles' — run those on a separate
 # VM) and the V8 build (profile 'v8' — special-purpose, needs /data). Give the VM
 # room: DISK=40 (+ a golden baked with META=kali-linux-core to avoid duplication).
@@ -64,17 +66,18 @@ apt_repos:
       - code-insiders
 
 # NB: Ghidra is NOT fetched via `downloads:` — the release asset's filename
-# carries a per-build date stamp (ghidra_12.0.4_PUBLIC_<YYYYMMDD>.zip) that is
+# carries a per-build date stamp (ghidra_12.1.4_PUBLIC_<YYYYMMDD>.zip) that is
 # painful to pin. It is resolved from the GitHub API and extracted in the first
-# run_command below instead (version 12.0.4, to match the ghidra-mcp extension).
+# run_command below instead (version 12.1.4, to match the ghidra-mcp extension).
 
 git_repos:
   - repo: https://github.com/swisskyrepo/PayloadsAllTheThings.git
     dest: /opt/PayloadsAllTheThings
     depth: 1
     become: true
-  # Ghidra <-> OpenCode MCP bridge (community project — see the MCP doc).
-  - repo: https://github.com/MIGINC/ghidra-mcp.git
+  # Ghidra <-> OpenCode MCP bridge. Upstream bethington/ghidra-mcp (groupId
+  # com.xebyte): its pom + source are kept in sync and build against Ghidra 12.1.x.
+  - repo: https://github.com/bethington/ghidra-mcp.git
     dest: /home/kali/tools/ghidra-mcp
     become: false
   # PromptScope — your own app, PUBLIC GitHub repo. Set the real URL and
@@ -96,35 +99,50 @@ host_binaries:
     group: kali
     mode: "0644"
 
+  - src: opencode-telemetry.env
+    dest: /home/kali/.config/opencode/telemetry.env
+    owner: kali
+    group: kali
+    mode: "0644"
+
+ghidra_memory_enabled: true
 run_commands:
-  # Resolve + install Ghidra 12.0.4 from its GitHub release. The asset's date
+  # Resolve + install Ghidra 12.1.4 from its GitHub release. The asset's date
   # stamp changes per patch build, so look the URL up via the API rather than
-  # pinning a fragile filename. Idempotent: skipped once /opt/ghidra_*_PUBLIC exists.
+  # pinning a fragile filename. Guard is version-specific so it won't be satisfied
+  # by a stale 12.0.4 install (remove any old /opt/ghidra_*_PUBLIC when bumping).
   - cmd: >-
-      ls -d /opt/ghidra_*_PUBLIC >/dev/null 2>&1 ||
-      { url=$(curl -fsSL https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_12.0.4_build
-      | grep -oE 'https://[^"]*ghidra_12\.0\.4_PUBLIC_[0-9]+\.zip' | head -1) ;
-      [ -n "$url" ] || { echo 'cannot resolve the Ghidra 12.0.4 asset URL'; exit 1; } ;
+      ls -d /opt/ghidra_12.1.4_PUBLIC >/dev/null 2>&1 ||
+      { url=$(curl -fsSL https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_12.1.4_build
+      | grep -oE 'https://[^"]*ghidra_12\.1\.4_PUBLIC_[0-9]+\.zip' | head -1) ;
+      [ -n "$url" ] || { echo 'cannot resolve the Ghidra 12.1.4 asset URL'; exit 1; } ;
       echo "downloading $url" ; curl -fsSL "$url" -o /tmp/ghidra.zip
       && unzip -q -o /tmp/ghidra.zip -d /opt && rm -f /tmp/ghidra.zip ; }
     become: true
-  - cmd: "ln -sf /opt/ghidra_*/ghidraRun /usr/local/bin/ghidra"
+  - cmd: "ln -sf /opt/ghidra_12.1.4_PUBLIC/ghidraRun /usr/local/bin/ghidra"
     become: true
   # The GhidraMCP extension deploys into the install's Extensions/Ghidra dir, but
   # Ghidra was unzipped as root. Give the kali user the install (single-user lab
   # VM) so the deploy, run as kali, can write there.
-  - cmd: "chown -R kali:kali $(ls -d /opt/ghidra_*_PUBLIC | head -1)"
+  - cmd: "chown -R kali:kali /opt/ghidra_12.1.4_PUBLIC"
     become: true
   - cmd: "pipx ensurepath"
     become: false
-  - cmd: "curl -fsSL https://opencode.ai/install | bash"
+  # OpenCode — install only when missing (creates: guard skips the whole task),
+  # and bound the download with a timeout so a stall can't hang the run.
+  - cmd: "timeout 600 sh -c 'curl -fsSL https://opencode.ai/install | bash'"
     become: false
     creates: "/home/kali/.opencode/bin/opencode"
-  # Claude Code (native installer; idempotent via the `command -v` guard).
-  # Alternative if you prefer npm: `npm install -g @anthropic-ai/claude-code`
-  # (needs Node.js >= 18 — add nodejs/npm to apt_packages in that case).
-  - cmd: "command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash"
+  # Claude Code (native installer). `creates:` is the primary skip; the inline
+  # guard also checks the usual install dirs because PATH is minimal in this
+  # non-login shell (so `command -v claude` alone misses an existing install and
+  # would re-run — and hang — the installer). Timeout bounds the first install.
+  # Alternative: npm install -g @anthropic-ai/claude-code (needs Node.js >= 18).
+  - cmd: >-
+      { command -v claude || [ -x "$HOME/.local/bin/claude" ] || [ -x "$HOME/.claude/bin/claude" ]; } >/dev/null 2>&1
+      || timeout 600 sh -c 'curl -fsSL https://claude.ai/install.sh | bash'
     become: false
+    creates: /home/kali/.local/bin/claude
   - cmd: "pipx install --force git+https://github.com/fortra/impacket.git"
     become: false
     creates: "/home/kali/.local/share/pipx/venvs/impacket"
@@ -134,37 +152,64 @@ run_commands:
   - cmd: "pipx install --force bloodhound"
     become: false
     creates: "/home/kali/.local/bin/bloodhound-python"
-  # ---- Ghidra <-> OpenCode via MCP (per the MIGINC/ghidra-mcp README) --------
+  # ---- Ghidra <-> OpenCode via MCP (per the bethington/ghidra-mcp README) ----
   # Kali's system Python is PEP 668 "externally-managed", so the setup's pip step
   # is run inside a dedicated venv (never system pip, never root). Java/Maven/unzip
-  # come from apt_packages above; the ghidra path is the unarchived 12.0.4 dir.
+  # come from apt_packages above; the ghidra path is the unarchived 12.1.4 dir.
   - cmd: >-
       test -x .venv/bin/python || python3 -m venv .venv ;
       .venv/bin/python -m pip install --upgrade pip &&
-      .venv/bin/python -m tools.setup preflight --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) &&
-      .venv/bin/python -m tools.setup ensure-prereqs --ghidra-path $(ls -d /opt/ghidra_*_PUBLIC | head -1) &&
+      .venv/bin/python -m tools.setup preflight --ghidra-path /opt/ghidra_12.1.4_PUBLIC &&
+      .venv/bin/python -m tools.setup ensure-prereqs --ghidra-path /opt/ghidra_12.1.4_PUBLIC &&
       touch /home/kali/.ghidra-mcp.prereqs ||
       { echo "[warn] ghidra-mcp prereqs step failed (non-fatal); the rest of the full profile is unaffected." ; true ; }
     chdir: /home/kali/tools/ghidra-mcp
     become: false
     creates: /home/kali/.ghidra-mcp.prereqs
-  # Build + deploy the extension into the kali user's Ghidra profile, same venv.
-  # GHIDRA_INSTALL_DIR must point at the Ghidra install: its jars are NOT on Maven
-  # Central, so without it the build fails with "Could not find artifact ghidra:*".
-  # This step is best-effort: the GhidraMCP Maven build is a version-locked, third
-  # party build, so a failure here only warns and never blocks the rest of 'full'
-  # (no marker is written, so a later provision retries it). OpenCode's mcp entry
-  # is already in place; the bridge works once the extension is built.
-  # In Ghidra once built: Tools -> GhidraMCP -> Start MCP Server (port 8089).
+  # Build + deploy the extension via tools.setup's GRADLE backend
+  # (TOOLS_SETUP_BACKEND=gradle). Gradle reads Ghidra's jars straight from
+  # GHIDRA_INSTALL_DIR (no Maven Central resolution, no install-file step) and
+  # writes the extension zip to build/distributions/, which tools.setup deploy
+  # then installs. JAVA_HOME must be JDK 21 (the extension targets release 21).
+  # Best-effort: a failure only warns and never blocks the rest of 'full' (no
+  # marker written, so a later provision retries). OpenCode's mcp entry is already
+  # in place; once deployed, enable it in Ghidra (File -> Install Extensions,
+  # restart) then Tools -> GhidraMCP -> Start MCP Server (port 8089).
   - cmd: >-
-      GHIDRA="$(ls -d /opt/ghidra_*_PUBLIC | head -1)" ;
-      GHIDRA_INSTALL_DIR="$GHIDRA" .venv/bin/python -m tools.setup build &&
+      GHIDRA=/opt/ghidra_12.1.4_PUBLIC ;
+      JDK21="$(ls -d /usr/lib/jvm/java-21-openjdk-* 2>/dev/null | head -1)" ;
+      export GHIDRA_INSTALL_DIR="$GHIDRA" JAVA_HOME="$JDK21" TOOLS_SETUP_BACKEND=gradle
+      PATH="/home/kali/tools/ghidra-mcp/.venv/bin:$PATH" ;
+      .venv/bin/python -m tools.setup build &&
       .venv/bin/python -m tools.setup deploy --ghidra-path "$GHIDRA" &&
       touch /home/kali/.ghidra-mcp.deployed ||
-      { echo "[warn] GhidraMCP extension build/deploy failed (version-locked Maven build). The rest of the full profile is installed; finish the extension manually per the ghidra-mcp README (it needs GHIDRA_INSTALL_DIR and the Ghidra jars in the local Maven repo)." ; true ; }
+      { echo "[warn] GhidraMCP extension build/deploy failed. The rest of the full profile is installed; finish it manually: GHIDRA_INSTALL_DIR=$GHIDRA ./gradlew buildExtension (needs JDK 21)." ; true ; }
     chdir: /home/kali/tools/ghidra-mcp
     become: false
     creates: /home/kali/.ghidra-mcp.deployed
+  # Install the Python bridge (and its deps, incl. `mcp`) straight INTO the venv,
+  # so OpenCode launches it with a plain `.venv/bin/python -m bridge_mcp_ghidra`
+  # — no runtime `uv` needed. This matters: the lab usually runs behind a VPN
+  # killswitch with no Internet, where a per-launch `uv run` sync would fail (and
+  # `uv` isn't on PATH anyway — it only ever lived inside the venv). v7.0.0 ships
+  # the bridge as a package under python/ described by the repo-root pyproject;
+  # an editable install exposes `bridge_mcp_ghidra` as a top-level module. Its own
+  # marker keeps it independent of the .deployed guard, so it runs even once the
+  # extension is already deployed.
+  - cmd: >-
+      .venv/bin/python -m pip install --quiet -e . &&
+      touch /home/kali/.ghidra-mcp.bridge-deps ||
+      { echo "[warn] bridge editable install failed; run it by hand: cd /home/kali/tools/ghidra-mcp && .venv/bin/python -m pip install -e ." ; true ; }
+    chdir: /home/kali/tools/ghidra-mcp
+    become: false
+    creates: /home/kali/.ghidra-mcp.bridge-deps
+  - cmd: |
+      source_line='. "$HOME/.config/opencode/telemetry.env"'
+      for rc in /home/kali/.profile /home/kali/.bashrc /home/kali/.zshrc; do
+        grep -qxF -- "$source_line" "$rc" 2>/dev/null ||
+          printf '\n%s\n' "$source_line" >> "$rc"
+      done
+    become: false    
   # ---- PromptScope (your app) — PUBLIC repo. Fill in and uncomment -----------
   # 1) uncomment the git_repos PromptScope entry above with the real URL;
   # 2) replace <BUILD/INSTALL CMD> with how PromptScope builds/installs, e.g.
@@ -172,3 +217,6 @@ run_commands:
   #- cmd: "<BUILD/INSTALL CMD>"
   #  chdir: /home/kali/tools/PromptScope
   #  become: false
+
+
+

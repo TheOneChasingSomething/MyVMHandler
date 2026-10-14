@@ -19,7 +19,11 @@
 min_free_gb: 25
 min_free_path: /data
 
-# Base tools; depot_tools' install-build-deps.sh pulls the full toolchain.
+# Minimal build deps for a headless d8 (x64.release). We deliberately do NOT rely
+# on Chromium's install-build-deps.sh for these: that script validates its whole
+# (GUI-heavy) list in one apt dry-run and aborts on a single obsolete name — on
+# Kali that is `libfuse2` (time64 transition → libfuse2t64). V8 brings its own
+# hermetic clang + sysroot, so d8 needs far less than full Chromium.
 apt_packages:
   - git
   - curl
@@ -28,6 +32,14 @@ apt_packages:
   - lsb-release
   - xz-utils
   - pkg-config
+  - build-essential        # host C/C++ toolchain
+  - libglib2.0-dev
+  - libatomic1
+  - ca-certificates
+  # NB: no fuse package here — d8 does not need it (fuse is for Chromium's
+  # packaging/sandbox, not the V8 engine), and its name is unstable across Kali
+  # releases (libfuse2 / libfuse2t64 / libfuse3-3). install-build-deps still asks
+  # for it, which is exactly why that step is best-effort below.
 
 # Give the SSH user ownership of the mounted data disk so it can check V8 out.
 directories:
@@ -50,8 +62,15 @@ run_commands:
     creates: /data/v8/.git
     become: false
 
-  # 2) Install build dependencies (needs root).
-  - cmd: "./build/install-build-deps.sh --no-prompt && touch /data/v8/.deps-installed"
+  # 2) Install build dependencies (needs root). Best-effort: the core deps come
+  # from apt_packages above (V8's hermetic toolchain covers the rest), so even if
+  # Chromium's install-build-deps aborts on an obsolete package (e.g. libfuse2 on
+  # Kali) we warn and carry on. The marker is always written so the step is
+  # idempotent; the real test is whether step 3 (the build) succeeds.
+  - cmd: >-
+      ./build/install-build-deps.sh --no-prompt --unsupported ||
+      echo "[warn] install-build-deps incomplete (e.g. libfuse2 obsolete on Kali) — relying on apt_packages + V8's hermetic toolchain" ;
+      touch /data/v8/.deps-installed
     chdir: /data/v8
     creates: /data/v8/.deps-installed
     become: true

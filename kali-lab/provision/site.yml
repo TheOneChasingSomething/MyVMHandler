@@ -428,6 +428,29 @@
       loop_control:
         label: "{{ item.cmd | truncate(60) }}"
 
+    - name: Configuration mémoire de Ghidra
+      when: ghidra_memory_enabled | default(false) | bool
+      block:
+        - name: Configurer le heap maximal de Ghidra
+          become: true
+          become_user: root
+          ansible.builtin.lineinfile:
+            path: /etc/environment
+            regexp: '^\s*GHIDRA_MAXMEM\s*='
+            line: >-
+              GHIDRA_MAXMEM={{ (ansible_facts['memtotal_mb'] | int) // 2 }}M
+            create: true
+            owner: root
+            group: root
+            mode: "0644"
+          register: ghidra_memory_config
+
+        - name: Afficher le résultat
+          ansible.builtin.debug:
+            var: ghidra_memory_config
+
+
+
     # ---- Autostart applications at VM boot --------------------------------
     # Launch apps/services automatically when the VM starts. Per-entry mode (gui):
     #   gui: true  → an XDG autostart .desktop launched by the graphical session
