@@ -1,0 +1,519 @@
+diff --git a/README.md b/README.md
+index 0edcd4c..53a9e76 100644
+--- a/README.md
++++ b/README.md
+@@ -169,6 +169,41 @@ make provision VM=rev PROFILE=full     # offensive toolkit + RE + AD + Ghidra +
+ make provision VM=rev PROFILE=v8       # then add a V8 checkout + d8 build on /data
+ ```
+ 
++### Live services pane on SSH login (`full` profile)
++
++The `full` profile automatically attaches interactive Bash/Zsh SSH logins to a
++persistent tmux session named `lab`. The shell stays focused in the upper pane;
++the lower pane shows a live inventory, refreshed every **5 seconds**:
++
++- All Docker containers: name, image, published/internal ports and status,
++  including health checks and stopped containers.
++- Non-Docker listening TCP/UDP services, identified from their process names
++  (including Python modules), plus the running/failed systemd service counts.
++
++Use **Ctrl-b, then Down** to focus the services pane, **Up/Down** or **PgUp/PgDn**
++to scroll, **r** to refresh, and **Ctrl-b, then z** to zoom/unzoom. **Ctrl-b, then
++Up** returns to the shell. Reconnecting reuses the session without duplicating
++the pane; a closed services pane is restored on the next connection. Normal
++tmux defaults apply (including **Ctrl-b, then d** to detach).
++
++The profile settings are `ssh_dashboard_enabled`, `ssh_dashboard_session_name`,
++`ssh_dashboard_refresh_seconds` and `ssh_dashboard_pane_percent` (default: 45%).
++Set `LAB_SSH_DASHBOARD=0` before the managed block in the guest's `.bashrc` or
++`.zshrc` to opt out of automatic attachment. The table is also available as
++`lab-services` (one-off) or `lab-services --watch 5` (interactive).
++
++To add/update just this feature on an already-provisioned VM, from `kali-lab/`:
++
++```bash
++venv/bin/ansible-playbook -i '<vm-ip>,' -u kali provision/site.yml \
++  -e @provision/profiles/full.yml --tags ssh_dashboard
++```
++
++The dashboard uses Python's standard library, `ss` and `ps`; it tolerates Docker
++being absent/unavailable. Where existing sudo permissions allow it, passwordless
++read-only queries identify sockets owned by other users. Remote commands and
++non-interactive SSH sessions keep their usual behaviour.
++
+ ### Growing a data disk in place (no rebuild, no Terraform drift)
+ 
+ ```bash
+diff --git a/kali-lab/provision/profiles/full.yml b/kali-lab/provision/profiles/full.yml
+index eb47df0..c766374 100644
+--- a/kali-lab/provision/profiles/full.yml
++++ b/kali-lab/provision/profiles/full.yml
+@@ -11,13 +11,22 @@
+ min_free_gb: 10
+ min_free_path: /
+ 
++# Reconnect to a persistent shell with a live services pane on interactive SSH.
++ssh_dashboard_enabled: true
++ssh_dashboard_session_name: lab
++ssh_dashboard_refresh_seconds: 5
++ssh_dashboard_pane_percent: 45
++
+ apt_packages:
+   # dev / base
+   - git
+   - curl
+   - pipx
++  - python3
+   - python3-pip
+   - python3-venv          # ghidra-mcp setup runs pip inside a venv (PEP 668)
++  - iproute2             # ss: discover listening services for the SSH dashboard
++  - procps               # ps: identify Python modules behind listening sockets
+   - openjdk-21-jdk        # Ghidra
+   - awscli
+   - wireshark
+@@ -219,4 +228,3 @@ run_commands:
+   #  become: false
+ 
+ 
+-
+diff --git a/kali-lab/provision/site.yml b/kali-lab/provision/site.yml
+index d55937a..0840a0c 100644
+--- a/kali-lab/provision/site.yml
++++ b/kali-lab/provision/site.yml
+@@ -19,6 +19,8 @@
+ #   autostart      : [ { name, exec, gui, terminal } ]  launch apps/services at boot
+ #                    gui:true  → XDG .desktop (graphical session, DESKTOP golden)
+ #                    gui:false → systemd service as the SSH user (ready over SSH)
++#   ssh_dashboard_enabled : bool                     auto-attach tmux over SSH
++#   ssh_dashboard_session_name / refresh_seconds / pane_percent (prefixed ssh_dashboard_)
+ - name: Provision a deployed lab VM from a profile
+   hosts: all
+   become: true
+@@ -41,6 +43,10 @@
+     docker_run: []
+     run_commands: []
+     autostart: []
++    ssh_dashboard_enabled: false
++    ssh_dashboard_session_name: lab
++    ssh_dashboard_refresh_seconds: 5
++    ssh_dashboard_pane_percent: 45
+ 
+   tasks:
+     # ---- Preconditions ----------------------------------------------------
+@@ -233,6 +239,12 @@
+         content: "export PATH=\"{{ env_path | join(':') }}:$PATH\"\n"
+       when: env_path | length > 0
+ 
++    # ---- Interactive SSH services dashboard -------------------------------
++    - name: Configure the SSH tmux dashboard
++      ansible.builtin.import_tasks: tasks/ssh-dashboard.yml
++      when: ssh_dashboard_enabled | bool
++      tags: [ssh_dashboard]
++
+     # ---- OpenVPN ----------------------------------------------------------
+     - name: Check the .ovpn exists on the controller
+       ansible.builtin.stat:
+diff --git a/kali-lab/provision/files/lab-services.py b/kali-lab/provision/files/lab-services.py
+new file mode 100644
+index 0000000..0f80dbf
+--- /dev/null
++++ b/kali-lab/provision/files/lab-services.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++"""Live Docker / listening-service inventory; Python standard library only."""
++
++import argparse
++import curses
++from datetime import datetime
++import json
++import os
++from pathlib import Path
++import re
++import shlex
++import shutil
++import socket
++import subprocess
++import sys
++import textwrap
++import time
++
++
++def clean(value):
++    return " ".join("".join(c for c in str(value) if c.isprintable()).split())
++
++
++def run(command):
++    try:
++        result = subprocess.run(
++            command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
++            errors="replace", timeout=4, env={**os.environ, "LC_ALL": "C"},
++        )
++    except (OSError, subprocess.TimeoutExpired) as error:
++        return None, clean(error)
++    if result.returncode:
++        return None, clean(result.stderr or result.stdout or "command failed")
++    return result.stdout, None
++
++
++def read_sockets():
++    # Best effort only: never ask for a password or change sudo permissions.
++    if os.geteuid() != 0 and shutil.which("sudo"):
++        output, error = run(["sudo", "-n", "ss", "-H", "-lntup"])
++        if error is None:
++            return output, None
++    return run(["ss", "-H", "-lntup"])
++
++
++def process_name(name, command):
++    if not name.startswith(("python", "pypy")):
++        return name
++    try:
++        arguments = shlex.split(command)
++    except ValueError:
++        return name
++    if "-m" in arguments:
++        index = arguments.index("-m") + 1
++        if index < len(arguments):
++            return arguments[index]
++    for argument in arguments[1:]:
++        if argument.endswith(".py"):
++            path = Path(argument)
++            return str(Path(path.parent.name) / path.name)
++    return name
++
++
++def collect():
++    snapshot = {"containers": [], "listeners": [], "failed": [], "errors": []}
++    snapshot["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++    published = set()
++    if shutil.which("docker"):
++        command = ["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"]
++        output, error = run(command)
++        if error and os.geteuid() != 0 and shutil.which("sudo"):
++            output, error = run(["sudo", "-n", *command])
++        if error:
++            snapshot["errors"].append("Docker: " + error)
++        else:
++            try:
++                snapshot["containers"] = sorted(
++                    (json.loads(line) for line in output.splitlines() if line),
++                    key=lambda row: row["Names"],
++                )
++            except (ValueError, KeyError) as error:
++                snapshot["errors"].append("Docker inventory: " + str(error))
++    else:
++        snapshot["errors"].append("Docker is not installed.")
++    for row in snapshot["containers"]:
++        for match in re.finditer(r"([^,\s]+):(\d+)->\d+/(tcp|udp)", row["Ports"]):
++            published.add((match[3], match[1], match[2]))
++
++    output, error = run([
++        "systemctl", "list-units", "--type=service", "--state=running,failed",
++        "--no-legend", "--plain", "--no-pager",
++    ])
++    snapshot["running_units"] = None if error else 0
++    if error:
++        snapshot["errors"].append("systemd: " + error)
++    else:
++        for line in output.splitlines():
++            fields = line.split(None, 4)
++            if len(fields) >= 4:
++                if fields[2] == "failed":
++                    snapshot["failed"].append((fields[0], fields[3]))
++                elif fields[3] == "running":
++                    snapshot["running_units"] += 1
++
++    output, error = read_sockets()
++    if error:
++        snapshot["errors"].append("Listening sockets: " + error)
++        return snapshot
++    listeners = {}
++    for line in output.splitlines():
++        fields = line.split(None, 6)
++        if len(fields) < 6:
++            continue
++        protocol, state, _, _, address, _ = fields[:6]
++        host, port = address.rsplit(":", 1)
++        process = re.search(r'\("([^"]+)",pid=(\d+)', fields[6] if len(fields) > 6 else "")
++        name, pid = process.groups() if process else ("unknown", "")
++        if name == "docker-proxy" or (protocol, host, port) in published:
++            continue
++        key = (pid, name)
++        listener = listeners.setdefault(key, {"ports": set(), "states": set()})
++        listener["ports"].add(f"{protocol} {address}")
++        listener["states"].add("BOUND" if state == "UNCONN" else state)
++    pids = sorted({pid for pid, _ in listeners if pid})
++    commands = {}
++    if pids:
++        output, _ = run(["ps", "-ww", "-p", ",".join(pids), "-o", "pid=,args="])
++        for line in (output or "").splitlines():
++            fields = line.strip().split(None, 1)
++            if len(fields) == 2:
++                commands[fields[0]] = fields[1]
++    for (pid, name), listener in listeners.items():
++        label = process_name(name, commands.get(pid, ""))
++        if pid:
++            label += f" (pid {pid})"
++        snapshot["listeners"].append((
++            label, ", ".join(sorted(listener["ports"])), " / ".join(sorted(listener["states"])),
++        ))
++    snapshot["listeners"].sort()
++    return snapshot
++
++
++def table(headers, rows, width, weights):
++    available = max(len(headers), width - 3 * (len(headers) - 1))
++    widths = [max(1, int(available * weight)) for weight in weights]
++    widths[0] += available - sum(widths)
++    lines = []
++    for index, row in enumerate([headers, *rows]):
++        cells = [textwrap.wrap(clean(cell), size, break_on_hyphens=False) or [""]
++                 for cell, size in zip(row, widths)]
++        for part in range(max(map(len, cells))):
++            lines.append(" | ".join(
++                (cell[part] if part < len(cell) else "").ljust(size)
++                for cell, size in zip(cells, widths)
++            ).rstrip())
++        if index == 0:
++            lines.append("-+-".join("-" * size for size in widths))
++    return lines
++
++
++def render(snapshot, width):
++    containers = snapshot["containers"]
++    running = sum(row.get("State") == "running" for row in containers)
++    healthy = sum("(healthy)" in row.get("Status", "") for row in containers)
++    units = snapshot["running_units"]
++    summary = (
++        f"Docker: {running}/{len(containers)} running, {healthy} healthy | "
++        f"systemd: {units if units is not None else '?'} running, "
++        f"{len(snapshot['failed']) if units is not None else '?'} failed"
++    )
++    lines = [f"KALI SERVICES | {socket.gethostname()} | {snapshot['updated']}"]
++    lines += textwrap.wrap(summary, width)
++    lines += ["", "DOCKER CONTAINERS (host:port -> container port)"]
++    if containers:
++        rows = [(row["Names"], row["Image"], row["Ports"] or "not published", row["Status"])
++                for row in containers]
++        lines += table(("CONTAINER", "IMAGE", "PORTS", "STATUS"), rows, width, (.28, .23, .30, .19))
++        lines += textwrap.wrap("Ports without '->' are internal/exposed only.", width)
++    else:
++        lines.append("No containers found.")
++    lines += ["", "HOST SERVICES (non-Docker listening/bound sockets)"]
++    if snapshot["listeners"]:
++        lines += table(("SERVICE / PROCESS", "PORTS", "STATUS"), snapshot["listeners"],
++                       width, (.35, .50, .15))
++    else:
++        lines.append("No listening services found.")
++    if snapshot["failed"]:
++        lines += ["", "FAILED SYSTEMD SERVICES"]
++        lines += table(("UNIT", "STATUS"), snapshot["failed"], width, (.75, .25))
++    for error in snapshot["errors"]:
++        lines += [""] + textwrap.wrap(clean(error), width)
++    return lines
++
++
++def watch(screen, interval):
++    try:
++        curses.curs_set(0)
++    except curses.error:
++        pass
++    screen.keypad(True)
++    offset, next_refresh = 0, 0
++    while True:
++        if time.monotonic() >= next_refresh:
++            snapshot = collect()
++            next_refresh = time.monotonic() + interval
++        height, width = screen.getmaxyx()
++        body_height = max(1, height - 1)
++        lines = render(snapshot, max(20, width - 1))
++        last_offset = max(0, len(lines) - body_height)
++        offset = min(max(0, offset), last_offset)
++        screen.erase()
++        for y, line in enumerate(lines[offset:offset + body_height]):
++            try:
++                screen.addnstr(y, 0, line, max(0, width - 1))
++            except curses.error:
++                pass
++        footer = f"Up/Down PgUp/PgDn: scroll | r: refresh | q: close | {offset + 1}/{len(lines)}"
++        try:
++            screen.addnstr(height - 1, 0, footer, max(0, width - 1), curses.A_REVERSE)
++        except curses.error:
++            pass
++        screen.refresh()
++        screen.timeout(250)
++        key = screen.getch()
++        if key in (ord("q"), ord("Q")):
++            return
++        if key in (curses.KEY_DOWN, ord("j")):
++            offset += 1
++        elif key in (curses.KEY_UP, ord("k")):
++            offset -= 1
++        elif key == curses.KEY_NPAGE:
++            offset += body_height
++        elif key == curses.KEY_PPAGE:
++            offset -= body_height
++        elif key in (curses.KEY_HOME, ord("g")):
++            offset = 0
++        elif key in (curses.KEY_END, ord("G")):
++            offset = last_offset
++        elif key in (ord("r"), ord("R")):
++            next_refresh = 0
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--watch", type=float, nargs="?", const=5, metavar="SECONDS",
++                        help="refresh interactively (default: 5 seconds)")
++    parser.add_argument("--width", type=int, default=shutil.get_terminal_size((120, 40)).columns,
++                        help="table width for a one-off report")
++    args = parser.parse_args()
++    if args.watch is not None:
++        if args.watch < 1:
++            parser.error("--watch must be at least 1 second")
++        if not sys.stdin.isatty() or not sys.stdout.isatty():
++            parser.error("--watch requires an interactive terminal")
++        try:
++            curses.wrapper(watch, args.watch)
++        except KeyboardInterrupt:
++            pass
++    else:
++        print("\n".join(render(collect(), max(20, args.width))))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/kali-lab/provision/files/ssh-dashboard.sh b/kali-lab/provision/files/ssh-dashboard.sh
+new file mode 100644
+index 0000000..589930d
+--- /dev/null
++++ b/kali-lab/provision/files/ssh-dashboard.sh
+@@ -0,0 +1,16 @@
++# Sourced from interactive Bash/Zsh rc files. Remote commands, scp, sftp and
++# Ansible do not enter tmux; shells inside an existing tmux do not nest it.
++case $- in
++    *i*)
++        if [ -n "${SSH_CONNECTION:-}" ] &&
++           [ -z "${SSH_ORIGINAL_COMMAND:-}" ] &&
++           [ -z "${TMUX:-}" ] &&
++           [ "${LAB_SSH_DASHBOARD:-1}" != 0 ] &&
++           [ "${TERM:-dumb}" != dumb ] &&
++           [ -t 0 ] && [ -t 1 ] &&
++           [ -x /usr/local/bin/lab-ssh-dashboard ] &&
++           command -v tmux >/dev/null 2>&1; then
++            /usr/local/bin/lab-ssh-dashboard
++        fi
++        ;;
++esac
+diff --git a/kali-lab/provision/tasks/ssh-dashboard.yml b/kali-lab/provision/tasks/ssh-dashboard.yml
+new file mode 100644
+index 0000000..fe35035
+--- /dev/null
++++ b/kali-lab/provision/tasks/ssh-dashboard.yml
+@@ -0,0 +1,63 @@
++---
++- name: Validate SSH dashboard settings
++  ansible.builtin.assert:
++    that:
++      - ssh_dashboard_session_name is match('^[A-Za-z0-9_-]+$')
++      - (ssh_dashboard_refresh_seconds | int) >= 1
++      - (ssh_dashboard_pane_percent | int) >= 20
++      - (ssh_dashboard_pane_percent | int) <= 80
++    fail_msg: "Use a simple tmux session name, a refresh >= 1 s and a pane size of 20–80%."
++
++- name: Find the SSH user's home directory
++  ansible.builtin.getent:
++    database: passwd
++    key: "{{ ansible_user | default('kali') }}"
++
++- name: Create the dashboard support directory
++  ansible.builtin.file:
++    path: /usr/local/share/kali-lab
++    state: directory
++    owner: root
++    group: root
++    mode: "0755"
++
++- name: Install the live services table
++  ansible.builtin.copy:
++    src: lab-services.py
++    dest: /usr/local/bin/lab-services
++    owner: root
++    group: root
++    mode: "0755"
++
++- name: Install the SSH tmux launcher
++  ansible.builtin.template:
++    src: lab-ssh-dashboard.sh.j2
++    dest: /usr/local/bin/lab-ssh-dashboard
++    owner: root
++    group: root
++    mode: "0755"
++    validate: /bin/sh -n %s
++
++- name: Install the interactive SSH shell hook
++  ansible.builtin.copy:
++    src: ssh-dashboard.sh
++    dest: /usr/local/share/kali-lab/ssh-dashboard.sh
++    owner: root
++    group: root
++    mode: "0644"
++    validate: /bin/sh -n %s
++
++- name: Enable the dashboard in Bash and Zsh interactive shells
++  ansible.builtin.blockinfile:
++    path: "{{ ansible_facts.getent_passwd[ansible_user | default('kali')][4] }}/{{ item }}"
++    create: true
++    owner: "{{ ansible_user | default('kali') }}"
++    mode: "0644"
++    marker: "# {mark} KALI LAB SSH DASHBOARD"
++    block: |
++      if [ -r /usr/local/share/kali-lab/ssh-dashboard.sh ]; then
++        . /usr/local/share/kali-lab/ssh-dashboard.sh
++      fi
++  loop:
++    - .bashrc
++    - .zshrc
+diff --git a/kali-lab/provision/templates/lab-ssh-dashboard.sh.j2 b/kali-lab/provision/templates/lab-ssh-dashboard.sh.j2
+new file mode 100644
+index 0000000..6d1b701
+--- /dev/null
++++ b/kali-lab/provision/templates/lab-ssh-dashboard.sh.j2
+@@ -0,0 +1,37 @@
++#!/bin/sh
++# {{ ansible_managed }}
++# One persistent session per user; a server-side lock prevents duplicate panes
++# when two SSH clients connect at the same time.
++set -eu
++session={{ ssh_dashboard_session_name | quote }}
++lock="kali-lab-dashboard-$session"
++
++if ! tmux has-session -t "=$session" 2>/dev/null; then
++    size=$(stty size 2>/dev/null) || size='24 80'
++    rows=${size%% *}
++    columns=${size##* }
++    tmux new-session -d -s "$session" -n shell -x "$columns" -y "$rows" ||
++        tmux has-session -t "=$session"
++fi
++
++tmux wait-for -L "$lock"
++trap 'tmux wait-for -U "$lock" >/dev/null 2>&1 || true' 0
++trap 'exit 1' HUP INT TERM
++
++case "$(tmux list-panes -s -t "=$session" -F '#{@lab_services_dashboard}')" in
++    *enabled*) ;;
++    *)
++        shell_pane=$(tmux display-message -p -t "=$session" '#{pane_id}')
++        if dashboard_pane=$(tmux split-window -d -v -l '{{ ssh_dashboard_pane_percent | int }}%' \
++            -t "$shell_pane" -P -F '#{pane_id}' \
++            '/usr/local/bin/lab-services --watch {{ ssh_dashboard_refresh_seconds | int }}'); then
++            tmux set-option -p -t "$dashboard_pane" @lab_services_dashboard enabled
++            tmux select-pane -t "$dashboard_pane" -T Services
++            tmux set-option -w -t "$dashboard_pane" pane-border-status top
++        fi
++        ;;
++esac
++
++tmux wait-for -U "$lock"
++trap - 0 HUP INT TERM
++exec tmux attach-session -t "=$session"

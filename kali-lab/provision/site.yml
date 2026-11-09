@@ -71,6 +71,16 @@
             success_msg: "{{ min_free_gb }} GiB requis disponibles sur {{ min_free_path }}."
 
     # ---- apt packages + external signed repositories (v1) -----------------
+    # gpg is needed to dearmor the signing keys below, but a lean golden baked
+    # from kali-linux-core / kali-linux-headless does NOT ship gnupg. Install it
+    # first (it lives in Kali's base repos, so no external repo is needed yet).
+    - name: Ensure gnupg is present for dearmoring signing keys
+      ansible.builtin.apt:
+        name: gnupg
+        state: present
+        update_cache: true
+      when: apt_repos | length > 0
+
     - name: Ensure the apt keyrings directory exists
       ansible.builtin.file:
         path: /etc/apt/keyrings
@@ -427,29 +437,6 @@
       loop: "{{ run_commands }}"
       loop_control:
         label: "{{ item.cmd | truncate(60) }}"
-
-    - name: Configuration mémoire de Ghidra
-      when: ghidra_memory_enabled | default(false) | bool
-      block:
-        - name: Configurer le heap maximal de Ghidra
-          become: true
-          become_user: root
-          ansible.builtin.lineinfile:
-            path: /etc/environment
-            regexp: '^\s*GHIDRA_MAXMEM\s*='
-            line: >-
-              GHIDRA_MAXMEM={{ (ansible_facts['memtotal_mb'] | int) // 2 }}M
-            create: true
-            owner: root
-            group: root
-            mode: "0644"
-          register: ghidra_memory_config
-
-        - name: Afficher le résultat
-          ansible.builtin.debug:
-            var: ghidra_memory_config
-
-
 
     # ---- Autostart applications at VM boot --------------------------------
     # Launch apps/services automatically when the VM starts. Per-entry mode (gui):
