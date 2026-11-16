@@ -1,0 +1,27 @@
+{
+  "schema_version": "1",
+  "build_date": "2026-09-19T06:58:44Z",
+  "pipeline_commit": "83ddb45",
+  "golden": {
+    "metapackage": "kali-linux-headless",
+    "desktop": true,
+    "vnc": false
+  },
+  "os": {
+    "distribution": "Kali",
+    "release": "kali-rolling",
+    "version": "2026.2",
+    "pretty_name": "Kali GNU/Linux Rolling",
+    "kernel": "6.19.14+kali-amd64",
+    "architecture": "x86_64"
+  },
+  "update_level": {
+    "full_upgrade_at_bake": true,
+    "upgradable_packages": 0,
+    "apt_snapshot_date": "2026-09-19"
+  },
+  "iso": {
+    "url": "https://cdimage.kali.org/current/kali-linux-2026.2-installer-amd64.iso",
+    "sha256": "sha256:6dbefacc95e3b556c19c48e8bae39b8b505e2d3a1aba0bfb7ab62b036c3d2ba3"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "builds": [
+    {
+      "name": "kali",
+      "builder_type": "qemu",
+      "build_time": 1792235072,
+      "files": [
+        {
+          "name": "output-kali/kali-golden.qcow2",
+          "size": 4827971584
+        }
+      ],
+      "artifact_id": "VM",
+      "packer_run_uuid": "7a662822-2e63-63f5-af43-261845a6f3f4",
+      "custom_data": null
+    }
+  ],
+  "last_run_uuid": "7a662822-2e63-63f5-af43-261845a6f3f4"
+}

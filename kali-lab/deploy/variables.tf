@@ -75,3 +75,14 @@ variable "swap_size" {
   description = "cloud-init swap file size on first boot (e.g. 2G); empty = no swap. There is no swap partition (single-partition golden), so this provides swap."
   default     = ""
 }
+variable "share_path2" {
+  type        = string
+  description = "Optional SECOND host directory shared into the guest over virtiofs at /mnt/host2 (empty = no second share)."
+  default     = ""
+}
+
+variable "share_tag2" {
+  type        = string
+  description = "virtiofs mount tag for the second shared folder (must differ from share_tag)."
+  default     = "hostshare2"
+}

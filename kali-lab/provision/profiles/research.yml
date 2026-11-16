@@ -63,11 +63,14 @@ run_commands:
 #     automatically (all traffic via tun0) and the fail-closed killswitch blocks
 #     everything else, so the public IP never leaks if the tunnel drops.
 # Force either routing explicitly with openvpn.redirect_all: true/false.
-# Disabled by default (no .ovpn shipped). Uncomment and point 'config' at YOUR
-# absolute host path to enable it. Missing files are skipped with a warning.
+#
+# The .ovpn path is PERSONAL + SECRET and is deliberately NOT stored here (this
+# file is versioned). Put it in .env instead — gitignored, never committed:
+#     VPN_OVPN=/absolute/path/to/your.ovpn
+# `make provision` injects it as `-e vpn_ovpn=...`, which site.yml uses as the
+# effective config. Leave VPN_OVPN unset and the VPN is simply skipped.
 openvpn:
-  config: /home/me/Documents/7_-_Projets/202601201142_-_~~_OSCP_~~/universal.ovpn
-  autostart: true
-  # redirect_all: false      # force split/full regardless of killswitch
-vpn_killswitch: false         # true = full-tunnel + fail-closed killswitch (anonymity)
+  autostart: true              # connect automatically once a .ovpn is provided
+  # redirect_all: false        # force split/full regardless of killswitch
+vpn_killswitch: false          # true = full-tunnel + fail-closed killswitch (anonymity)
 lan_cidr: "192.168.122.0/24"

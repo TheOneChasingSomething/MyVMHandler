@@ -1,0 +1,7 @@
+$ make provision VM=poste PROFILE=pentest
+
+make[1]: Entering directory '/home/me/git/github.com/MyVMHandler/kali-lab'
+>> Provisioning poste (192.168.122.62) avec le profil 'pentest'
+ERROR: Ansible requires the locale encoding to be UTF-8; Detected None.
+make[1]: *** [Makefile:316: provision] Error 1
+make[1]: Leaving directory '/home/me/git/github.com/MyVMHandler/kali-lab'

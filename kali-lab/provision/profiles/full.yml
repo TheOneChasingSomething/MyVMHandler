@@ -55,6 +55,9 @@ apt_packages:
   - metasploit-framework
   - burpsuite
   - exploitdb
+  - nodejs
+  - npm
+  - python3-dev          # en-têtes Python (Python.h) pour compiler netifaces/arc4 (netexec)
 
 apt_repos:
   - name: vscode
@@ -217,6 +220,8 @@ run_commands:
   #- cmd: "<BUILD/INSTALL CMD>"
   #  chdir: /home/kali/tools/PromptScope
   #  become: false
-
+  - cmd: "npm install -g @openai/codex"
+    become: true
+    creates: /usr/local/bin/codex
 
 

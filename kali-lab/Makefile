@@ -35,12 +35,14 @@ RES        ?=
 VERBOSE    ?= false
 VARIANT    ?= installer
 POOL       ?= default
+POOL_TARGET ?= /var/lib/libvirt/images
 GOLDEN     ?= kali-golden
 SSH_USER   ?= kali
 BROWSER    ?= firefox-esr
 BINARY     ?=
 WORKLIST   ?= work/$(VM).apps
 VM         ?= kali-lab-01
+FORCE      ?=
 SNAP       ?= clean
 MEM        ?= 4096
 VCPU       ?= 2
@@ -51,6 +53,13 @@ SRC        ?= $(VM)
 SPICE      ?= true
 SHARE      ?= $(CURDIR)/shared
 SHARE_TAG  ?= hostshare
+SHARE2     ?=
+SHARE_TAG2 ?= hostshare2
+DST        ?= /mnt/host2
+TAG        ?=
+# Absolute HOST path to your .ovpn, for `make provision`. Keep it in .env
+# (gitignored), NEVER in a profile: it is injected as `-e vpn_ovpn=...`.
+VPN_OVPN   ?=
 SWAP       ?= 2G
 PROFILE    ?= research
 IMG        ?= $(GOLDEN).qcow2
@@ -119,13 +128,13 @@ help:
 	@echo
 else
 
-.PHONY: help check tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-resize data-delete apps-save apps-restore info provenance disk gc note export
+.PHONY: help check fix-apparmor pool-init ensure-virtiofsd ensure-golden tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui web reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-resize data-delete apps-save apps-restore info provenance disk gc note share export
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "Vars: META=$(META)  DESKTOP=$(DESKTOP)  GOLDEN=$(GOLDEN)  VM=$(VM)  DATA=$(DATA)  SHARE=$(SHARE)"
+	@echo "Vars: META=$(META)  DESKTOP=$(DESKTOP)  GOLDEN=$(GOLDEN)  VM=$(VM)  DATA=$(DATA)  SHARE=$(SHARE)  SHARE2=$(SHARE2)"
 	@echo "      KBD=$(KBD)  UPGRADE=$(UPGRADE)  SPICE=$(SPICE)  MEM=$(MEM)  VCPU=$(VCPU)  DISK=$(DISK)  TF=$(TF)"
 	@echo
 	@echo "Detailed help for a target:  make <target> help   (e.g. make deploy help)"
@@ -152,7 +161,69 @@ check: ## Test the toolchain (packer, terraform, ansible venv, KVM/libvirt)
 	  || echo "  [!!]  réseau 'default' inactif : sudo virsh net-start default; sudo virsh net-autostart default"
 	@virsh -c qemu:///system pool-list --name 2>/dev/null | tr -d '[:blank:]' | grep -qx default \
 	  && echo "  [OK]  pool de stockage 'default' actif" \
-	  || echo "  [!!]  pool 'default' inactif : sudo virsh pool-start default; sudo virsh pool-autostart default"
+	  || echo "  [!!]  pool 'default' absent/inactif : make pool-init (ou: sudo virsh pool-start default; sudo virsh pool-autostart default)"
+	@{ command -v virtiofsd >/dev/null 2>&1 || [ -x /usr/libexec/virtiofsd ] || [ -x /usr/lib/qemu/virtiofsd ]; } \
+	  && echo "  [OK]  virtiofsd présent (partages virtiofs)" \
+	  || echo "  [!!]  virtiofsd absent (requis pour SHARE/virtiofs) : make ensure-virtiofsd (ou sudo apt-get install virtiofsd)"
+	@if { command -v aa-enabled >/dev/null 2>&1 && aa-enabled >/dev/null 2>&1; } || [ -d /sys/kernel/security/apparmor ]; then \
+	  if grep -Eq '^[[:space:]]*security_driver[[:space:]]*=[[:space:]]*"none"' /etc/libvirt/qemu.conf 2>/dev/null; then \
+	    echo "  [OK]  AppArmor actif, qemu non confiné (security_driver=none)"; \
+	  else \
+	    echo "  [i]   AppArmor confine qemu : si un deploy échoue sur '.../kali-golden.qcow2: Permission denied',"; \
+	    echo "        lance ->  make fix-apparmor   (voir 'make fix-apparmor help' pour l'option qui garde AppArmor)"; \
+	  fi; \
+	else echo "  [OK]  AppArmor inactif (pas d'interférence qemu)"; fi
+
+fix-apparmor: ## Work around AppArmor denying qemu access to the golden (lab: disable qemu confinement)
+#: Detail  : on hosts where AppArmor confines qemu, the per-VM profile may not include
+#:           the golden backing file, so a deploy fails with 'Could not open
+#:           .../kali-golden.qcow2: Permission denied'. This sets security_driver="none"
+#:           in /etc/libvirt/qemu.conf and restarts libvirt — fine for a disposable lab.
+#:           To KEEP AppArmor instead (shared host), allow the pool in the local
+#:           abstraction and reload, without running this target:
+#:             echo '  /var/lib/libvirt/images/** rk,' | sudo tee -a /etc/apparmor.d/local/abstractions/libvirt-qemu
+#:             sudo systemctl reload apparmor
+#: Example : make fix-apparmor
+	@echo ">> setting security_driver=\"none\" in /etc/libvirt/qemu.conf and restarting libvirt"
+	@sudo sed -i -E 's/^#?[[:space:]]*security_driver[[:space:]]*=.*/security_driver = "none"/' /etc/libvirt/qemu.conf
+	@grep -Eq '^[[:space:]]*security_driver[[:space:]]*=[[:space:]]*"none"' /etc/libvirt/qemu.conf \
+	  || { echo 'security_driver = "none"' | sudo tee -a /etc/libvirt/qemu.conf >/dev/null; }
+	@sudo systemctl restart libvirtd 2>/dev/null || sudo systemctl restart virtqemud
+	@echo ">> done — qemu no longer AppArmor-confined; re-run 'make full' / 'make deploy'"
+
+ensure-virtiofsd: ## Install the host-side virtiofsd daemon if missing (needed for virtiofs shares)
+#: Detail  : virtiofs shares (SPICE=true + SHARE/SHARE2) need the host 'virtiofsd'
+#:           daemon. Installs it via apt only when absent; no-op if already present
+#:           (checked on PATH and in /usr/libexec, /usr/lib/qemu). 'full' calls it
+#:           automatically when a share is requested.
+#: Example : make ensure-virtiofsd
+	@if command -v virtiofsd >/dev/null 2>&1 || [ -x /usr/libexec/virtiofsd ] || [ -x /usr/lib/qemu/virtiofsd ]; then \
+	  echo ">> virtiofsd present"; \
+	else \
+	  echo ">> virtiofsd missing — installing (apt)"; \
+	  sudo apt-get install -y virtiofsd; \
+	fi
+
+pool-init: ## Ensure the libvirt storage pool '$(POOL)' exists, is started and autostarts
+#: Detail  : idempotently (re)creates the libvirt storage pool the lab uses — a 'dir'
+#:           pool on POOL_TARGET — then builds, starts and enables autostart. It is
+#:           read-only when the pool is already healthy (no sudo); sudo is invoked
+#:           ONLY to create/start/enable what is missing. install / data-create /
+#:           deploy depend on it, so a missing or stopped pool self-heals.
+#: Params  : POOL=<name,default>  POOL_TARGET=<dir,/var/lib/libvirt/images>
+#: Example : make pool-init
+	@set -e; \
+	  if ! virsh -c qemu:///system pool-info $(POOL) >/dev/null 2>&1; then \
+	    echo ">> pool '$(POOL)' missing — defining it (dir -> $(POOL_TARGET))"; \
+	    sudo virsh pool-define-as $(POOL) dir --target "$(POOL_TARGET)"; \
+	    sudo virsh pool-build $(POOL) 2>/dev/null || true; \
+	  fi; \
+	  info="$$(LC_ALL=C virsh -c qemu:///system pool-info $(POOL) 2>/dev/null)"; \
+	  printf '%s\n' "$$info" | grep -qE '^State:[[:space:]]+running' \
+	    || { echo ">> starting pool '$(POOL)'"; sudo virsh pool-start $(POOL); }; \
+	  printf '%s\n' "$$info" | grep -qE '^Autostart:[[:space:]]+yes' \
+	    || { echo ">> enabling autostart for pool '$(POOL)'"; sudo virsh pool-autostart $(POOL); }; \
+	  echo ">> pool '$(POOL)' ready (active + autostart)"
 
 tools: ## Install Packer + Terraform system-wide via HashiCorp apt repo (sudo)
 	wget -qO- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
@@ -231,7 +302,7 @@ bake: iso ## Fetch latest ISO, then build the golden qcow2 (META=, GUI=, VARIANT
 	    -var 'ansible_verbose=$(VERBOSE)' \
 	    -var "pipeline_commit=$$(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown)" .
 
-install: ## Upload the baked image into the pool as $(GOLDEN).qcow2 (no sudo, via libvirt)
+install: pool-init ## Upload the baked image into the pool as $(GOLDEN).qcow2 (no sudo, via libvirt)
 	@test -f $(PACKER_OUT) || { echo "!! $(PACKER_OUT) introuvable — lance 'make bake' d'abord"; exit 1; }
 	@# Refuse to overwrite a golden that VMs are backed on: it would corrupt them.
 	@deps=$$(for v in $$(virsh -c qemu:///system vol-list $(POOL) 2>/dev/null | awk 'NR>2 && $$1 ~ /\.qcow2$$/ && $$1 != "$(GOLDEN).qcow2" {print $$1}'); do \
@@ -260,13 +331,32 @@ install: ## Upload the baked image into the pool as $(GOLDEN).qcow2 (no sudo, vi
 	  echo "[i] pas de manifeste ($(MANIFEST_DIR)/kali-golden.json absent) — golden buildé avant cette fonctionnalité ?"; \
 	fi
 
-deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true attaches /data)
+# Guard: abort unless the user confirms an operation that overwrites/removes an
+# EXISTING VM. No-op when the domain does not exist (fresh deploy). Bypass with
+# FORCE=yes; a non-interactive run (no /dev/tty) also requires FORCE=yes.
+define confirm_vm
+if virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1 && [ "$(FORCE)" != "yes" ]; then \
+  if [ -e /dev/tty ]; then \
+    printf "[!] This will OVERWRITE/REMOVE the existing VM '%s' (root reset; /data kept). Continue? [y/N] " "$(VM)" >/dev/tty; \
+    read _a </dev/tty; case "$$_a" in y|Y|yes|o|O|oui) ;; *) echo "   aborted."; exit 1;; esac; \
+  else echo "[!] VM '$(VM)' exists and FORCE!=yes with no terminal — aborting (re-run with FORCE=yes)."; exit 1; fi; \
+fi
+endef
+
+deploy: ensure-terraform pool-init ## Deploy a VM (VM=<name> → workspace; DATA=true attaches /data)
 #: Detail  : instantiates a disposable VM from the golden (COW overlay) via Terraform,
 #:           one workspace per VM. Recreates the root overlay (root data reset); a
-#:           DATA=true disk is reattached intact. Root grows to DISK GiB.
+#:           DATA=true disk is reattached intact. Root grows to DISK GiB. Self-heals a
+#:           prior partial create: a domain left in libvirt but untracked by Terraform
+#:           (and its throwaway overlay + cloud-init ISO) is cleaned first; <vm>-data.raw
+#:           is never touched.
 #: Params  : VM=<name>  GOLDEN=<golden>  DISK=<GiB>  MEM=<MiB>  VCPU=<n>
 #:           DATA=true|false  SPICE=true|false  SHARE=<dir>  SWAP=<size>
+#:           SHARE2=<dir> (optional 2nd virtiofs share → /mnt/host2; needs SPICE=true)
 #: Example : make deploy VM=poste GOLDEN=kali-desktop DISK=50 DATA=true
+#: Example : make deploy VM=poste SHARE="$HOME/projetA" SHARE2="$HOME/projetB"
+#: Safety  : if VM=<name> already exists, asks for confirmation (root reset); FORCE=yes skips.
+	@$(confirm_vm)
 	@virsh -c qemu:///system vol-info --pool $(POOL) $(GOLDEN).qcow2 >/dev/null 2>&1 \
 	  || { echo "[!] golden '$(GOLDEN).qcow2' absent du pool '$(POOL)' — lance 'make install GOLDEN=$(GOLDEN)'"; exit 1; }
 	@# One Terraform workspace per VM so several VMs coexist, each in its own state.
@@ -274,7 +364,7 @@ deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true atta
 	@# DATA=true → resolve the persistent data image path and hand it to Terraform;
 	@# it must already exist (make data-create) so the disk is decoupled from the
 	@# VM's destroy lifecycle. Whole recipe is one shell so $$dpath survives.
-	@set -e; dpath=""; spath=""; \
+	@set -e; dpath=""; spath=""; spath2=""; \
 	  if [ "$(DATA)" = "true" ]; then \
 	    virsh -c qemu:///system vol-info --pool $(POOL) $(VM)-data.raw >/dev/null 2>&1 \
 	      || { echo "[!] DATA=true mais '$(VM)-data.raw' absent — lance 'make data-create VM=$(VM)'"; exit 1; }; \
@@ -286,11 +376,25 @@ deploy: ensure-terraform ## Deploy a VM (VM=<name> → workspace; DATA=true atta
 	    mkdir -p "$(SHARE)"; spath="$(SHARE)"; \
 	    echo ">> Dossier partagé virtiofs : $(SHARE) → /mnt/host (tag $(SHARE_TAG))"; \
 	  fi; \
+	  if [ -n "$(SHARE2)" ]; then \
+	    [ "$(SPICE)" = "true" ] || { echo "[!] SHARE2 exige SPICE=true (le XSLT ajoute virtiofs + mémoire partagée) — mets SPICE=true ou SHARE2= (vide)"; exit 1; }; \
+	    [ "$(SHARE_TAG2)" != "$(SHARE_TAG)" ] || { echo "[!] SHARE_TAG2 doit différer de SHARE_TAG ('$(SHARE_TAG)')"; exit 1; }; \
+	    mkdir -p "$(SHARE2)"; spath2="$(SHARE2)"; \
+	    echo ">> 2e dossier partagé virtiofs : $(SHARE2) → /mnt/host2 (tag $(SHARE_TAG2))"; \
+	  fi; \
 	  cd $(DEPLOY_DIR) && $(TF) init -upgrade && \
 	  { $(TF) workspace select $(VM) 2>/dev/null || $(TF) workspace new $(VM); } && \
+	  { if virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1 && ! $(TF) state list 2>/dev/null | grep -q '^libvirt_domain\.kali$$'; then \
+	      echo ">> orphan domain '$(VM)' exists in libvirt but not in Terraform state — cleaning up (data disk kept)"; \
+	      virsh -c qemu:///system destroy  $(VM) 2>/dev/null || true; \
+	      virsh -c qemu:///system undefine $(VM) 2>/dev/null || true; \
+	      virsh -c qemu:///system vol-delete --pool $(POOL) $(VM).qcow2          2>/dev/null || true; \
+	      virsh -c qemu:///system vol-delete --pool $(POOL) $(VM)-cloudinit.iso 2>/dev/null || true; \
+	    fi; } && \
 	  $(TF) apply -auto-approve -var 'vm_name=$(VM)' -var 'golden_volume=$(GOLDEN).qcow2' -var 'pool=$(POOL)' \
 	    -var 'memory_mb=$(MEM)' -var 'vcpu=$(VCPU)' -var 'disk_gb=$(DISK)' -var 'enable_spice_agent=$(SPICE)' \
 	    -var "data_disk_path=$$dpath" -var "share_path=$$spath" -var 'share_tag=$(SHARE_TAG)' \
+	    -var "share_path2=$$spath2" -var 'share_tag2=$(SHARE_TAG2)' \
 	    -var 'swap_size=$(SWAP)'
 
 provision: ## Apply a lab profile to a deployed VM over SSH (PROFILE=, Ansible)
@@ -305,7 +409,8 @@ provision: ## Apply a lab profile to a deployed VM over SSH (PROFILE=, Ansible)
 	  $(ACTIVATE) && ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
 	    -i "$$ip," -u $(SSH_USER) \
 	    -e "ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'" \
-	    $(PROVISION_DIR)/site.yml -e @$(PROFILES_DIR)/$(PROFILE).yml
+	    $(PROVISION_DIR)/site.yml -e @$(PROFILES_DIR)/$(PROFILE).yml \
+	    $(if $(strip $(VPN_OVPN)),-e vpn_ovpn='$(VPN_OVPN)')
 
 ip: ## Print the VM's current IP (guest agent → lease → TF output)
 	@$(LIVE_IP); echo "$$ip"
@@ -383,17 +488,54 @@ tui: ## Interactive text menu — asks what to do and runs the right make target
 #: Example : make tui
 	@python3 tui.py
 
+web: ## Launch the web console (VirtualBox-style control panel) on localhost
+#: Detail  : starts a dependency-free local web UI (web/server.py) wrapping virsh +
+#:           make: VM list / info / hardware, lifecycle, snapshots, memory & vCPU,
+#:           rename, delete, provision, live virtiofs share, VPN + kill-switch
+#:           toggles, and profile editing. Localhost only, no auth — lab host only.
+#: Params  : KL_WEB_HOST=<addr,127.0.0.1>  KL_WEB_PORT=<port,8674>
+#:           KL_SSH_USER=<kali>  KL_VPN_UNIT=<unit>  KL_KS_UNIT=<unit> (else discovered)
+#: Example : make web          # then open http://127.0.0.1:8674
+	@command -v python3 >/dev/null || { echo "[!] python3 requis"; exit 1; }
+	@python3 web/server.py
+
+ensure-golden: pool-init ## Bake + install the golden $(GOLDEN) only if it is missing from the pool
+#: Detail  : no-op when $(GOLDEN).qcow2 is already in the pool. Otherwise it installs
+#:           an existing baked artifact ($(PACKER_OUT)), or bakes one first (STAGE 1,
+#:           ~20-40 min) then installs it. Bake options (DESKTOP=, META=, KBD=…) given
+#:           on the command line propagate to the bake. Idempotent: present golden → skip.
+#: Params  : GOLDEN=<name>  POOL=<name>   (+ bake vars: DESKTOP= META= KBD= GUI= …)
+#: Example : make ensure-golden GOLDEN=kali-desktop DESKTOP=true
+	@if virsh -c qemu:///system vol-info --pool $(POOL) $(GOLDEN).qcow2 >/dev/null 2>&1; then \
+	  echo ">> golden '$(GOLDEN).qcow2' already in pool '$(POOL)' — skipping bake/install"; \
+	else \
+	  if [ -f $(PACKER_OUT) ]; then \
+	    echo ">> golden missing from pool; installing existing artifact $(PACKER_OUT) as $(GOLDEN).qcow2"; \
+	  else \
+	    echo ">> golden missing from pool and no baked artifact — baking it first (STAGE 1, long)…"; \
+	    $(MAKE) --no-print-directory bake; \
+	  fi; \
+	  $(MAKE) --no-print-directory install GOLDEN=$(GOLDEN); \
+	fi
+
 full: DISK := 50
 full: DATA_GB := 30
-full: ## One-shot ready VM: data disk + 50G root + SPICE + virtiofs share + PROFILE=full
-#: Detail  : orchestration in one command — creates the persistent data disk,
-#:           deploys the VM (50 GiB root, SPICE, DATA, virtiofs share), waits for
-#:           SSH (clearing the stale host key from a recreate), then applies the
-#:           'full' profile. Everything below is overridable on the command line.
+full: ## One-shot ready VM: (bake+install golden if missing) + data disk + 50G root + SPICE + share + PROFILE=full
+#: Detail  : orchestration in one command — runs the 'check' preflight, installs the
+#:           host virtiofsd daemon when a share is requested, ensures the golden exists
+#:           (bakes + installs it if the pool has none), creates the persistent data disk, deploys the VM
+#:           (50 GiB root, SPICE, DATA, virtiofs share), waits for SSH (clearing the
+#:           stale host key from a recreate), then applies the 'full' profile. The bake
+#:           only runs when the golden is missing; pass DESKTOP=/META=/KBD= to steer it.
 #: Params  : VM=<name>  DISK=<GiB,50>  DATA_GB=<GiB,30>  SHARE=<dir>  GOLDEN=<golden>
+#:           SHARE2=<dir> (optional 2nd virtiofs share → /mnt/host2)  DESKTOP= META= KBD=
 #: Example : make full VM=poste SHARE="$HOME/Documents/projetX"
+#: Example : make full VM=poste GOLDEN=kali-desktop DESKTOP=true KBD=fr   # first-time bake
+	@$(MAKE) --no-print-directory check
+	@if [ -n "$(strip $(SHARE))$(strip $(SHARE2))" ]; then $(MAKE) --no-print-directory ensure-virtiofsd; fi
+	@$(MAKE) --no-print-directory ensure-golden GOLDEN=$(GOLDEN)
 	@$(MAKE) --no-print-directory data-create VM=$(VM) DATA_GB=$(DATA_GB)
-	@$(MAKE) --no-print-directory deploy VM=$(VM) GOLDEN=$(GOLDEN) DISK=$(DISK) DATA=true SPICE=true SHARE="$(SHARE)"
+	@$(MAKE) --no-print-directory deploy VM=$(VM) GOLDEN=$(GOLDEN) DISK=$(DISK) DATA=true SPICE=true SHARE="$(SHARE)" SHARE2="$(SHARE2)"
 	@echo ">> waiting for SSH on $(VM) ..."; \
 	  ip=""; for i in $$(seq 1 90); do \
 	    $(LIVE_IP); \
@@ -403,9 +545,10 @@ full: ## One-shot ready VM: data disk + 50G root + SPICE + virtiofs share + PROF
 	  done; \
 	  [ -n "$$ip" ] || { echo "[!] SSH not ready — once up: make provision VM=$(VM) PROFILE=full"; exit 1; }
 	@$(MAKE) --no-print-directory provision VM=$(VM) PROFILE=full
-	@echo ">> '$(VM)' ready (full toolbox, /data, share on /mnt/host)."
+	@echo ">> '$(VM)' ready (full toolbox, /data, share on /mnt/host$(if $(SHARE2), + 2nd share on /mnt/host2))."
 
 reset: ## Force-remove a VM's libvirt domain + overlay/cloudinit (keeps <vm>-data.raw)
+	@$(confirm_vm)
 	-virsh -c qemu:///system destroy $(VM) 2>/dev/null
 	-virsh -c qemu:///system undefine $(VM) --nvram 2>/dev/null
 	-virsh -c qemu:///system vol-delete --pool $(POOL) $(VM).qcow2 2>/dev/null
@@ -451,6 +594,7 @@ snapshot-delete: ## Delete a snapshot (SNAP=<name>)
 	virsh -c qemu:///system snapshot-delete $(VM) "$(SNAP)"
 
 destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
+	@$(confirm_vm)
 	cd $(DEPLOY_DIR) && { $(TF) workspace select $(VM) 2>/dev/null \
 	  && $(TF) destroy -auto-approve -var 'vm_name=$(VM)'; } \
 	  || echo "[!] pas de workspace Terraform '$(VM)' (rien à détruire côté TF)"
@@ -458,7 +602,7 @@ destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
 # ---- Persistent data disk (survives destroy + redeploy onto a newer golden) ----
 # The image is a standalone raw volume that Terraform does NOT own; `make deploy
 # DATA=true` attaches it by path and cloud-init mounts it (by LABEL) on /data.
-data-create: ## Create the persistent data image $(VM)-data.raw (DATA_GB=)
+data-create: pool-init ## Create the persistent data image $(VM)-data.raw (DATA_GB=)
 #: Detail  : creates the persistent data image <VM>-data.raw (raw, sparse), mounted
 #:           at /data and kept across destroy/redeploy. If it already exists it is
 #:           kept (to enlarge it use `make data-resize`, not this target).
@@ -523,7 +667,7 @@ apps-restore: ## Reinstall packages saved from SRC (default $(VM)) onto VM
 	  echo ">> Restauration terminée ($(SRC).manual)"
 
 # ---- Provenance ----
-info: ## Show a VM's provenance (libvirt description + live guest manifest)
+info: ## Show a VM's provenance + hardware (libvirt description, hardware, live guest)
 	@echo "== Provenance de $(VM) =="
 	@echo "-- description libvirt (manifeste du golden + notes 'make note') --"
 	@virsh -c qemu:///system desc $(VM) 2>/dev/null || echo "  (domaine '$(VM)' introuvable)"
@@ -534,6 +678,17 @@ info: ## Show a VM's provenance (libvirt description + live guest manifest)
 	      'cat /etc/kali-lab-build.json' 2>/dev/null | (python3 -m json.tool 2>/dev/null || cat) \
 	      || echo "  (injoignable ou manifeste absent)"; \
 	  else echo "  (pas d'IP — VM éteinte ?)"; fi
+	@# ---- hardware, host view (defined in libvirt) ----
+	@echo; echo "-- hardware (defined — host view) --"
+	@LC_ALL=C virsh -c qemu:///system dominfo $(VM) 2>/dev/null | grep -iE 'CPU|memory|State' | sed 's/^/  /' || true
+	@echo "  disks:";  LC_ALL=C virsh -c qemu:///system domblklist $(VM) 2>/dev/null | sed '1,2d;/^$$/d;s/^/    /'
+	@echo "  nics:";   LC_ALL=C virsh -c qemu:///system domiflist  $(VM) 2>/dev/null | sed '1,2d;/^$$/d;s/^/    /'
+	@echo "  shares (virtiofs):"; LC_ALL=C virsh -c qemu:///system dumpxml $(VM) 2>/dev/null | grep -E "<filesystem|source dir=|target dir=" | sed 's/^[[:space:]]*/    /' || true
+	@# ---- hardware, guest view (detected via the QEMU agent, no SSH) ----
+	@echo; echo "-- hardware (detected by guest — QEMU agent) --"
+	@out=$$(LC_ALL=C virsh -c qemu:///system guestinfo $(VM) 2>/dev/null); \
+	  if [ -n "$$out" ]; then echo "$$out" | grep -iE 'hostname|os\.(id|name|pretty|version)|cpu|fs\.[0-9]+\.(name|mountpoint|total-bytes|used-bytes)' | sed 's/^/  /'; \
+	  else echo "  (guest agent unavailable — use 'make ssh VM=$(VM)' then lscpu / free -h / lsblk)"; fi
 
 provenance: info ## Alias of 'make info'
 
@@ -568,6 +723,41 @@ note: ## Append a timestamped worklog line to the VM's libvirt description (MSG=
 	  if [ "$$state" = "running" ]; then scope="--config --live"; else scope="--config"; fi; \
 	  virsh -c qemu:///system desc $(VM) $$scope "$$new" >/dev/null && \
 	  echo ">> note added to '$(VM)' : $$line   (see 'make info VM=$(VM)')"
+
+share: ## Hot-attach a host dir as a virtiofs share to a RUNNING VM (no reboot)
+#: Detail  : attaches an extra virtiofs device to a running VM and mounts it in the
+#:           guest, WITHOUT a reboot. Live-only: the share is NOT persisted — a
+#:           redeploy drops it. For a permanent share, redeploy with SHARE2=<dir>
+#:           (mounted on /mnt/host2 by cloud-init). Requires the VM to already have a
+#:           virtiofs share (its shared-memory backing must be present).
+#: Params  : VM=<name>  DIR=<host dir>  DST=<guest mountpoint,/mnt/host2>  TAG=<tag>
+#: Example : make share VM=poste DIR="$HOME/Documents/projetX" DST=/mnt/host2
+	@test -n "$(DIR)" || { echo "[!] DIR= requis — ex: make share VM=$(VM) DIR=\"$$HOME/projetX\" DST=$(DST)"; exit 1; }
+	@set -e; \
+	  state="$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)"; \
+	  [ "$$state" = "running" ] || { echo "[!] '$(VM)' n'est pas en cours d'exécution (état: $${state:-inconnu}) — démarre-la d'abord"; exit 1; }; \
+	  LC_ALL=C virsh -c qemu:///system dumpxml $(VM) | grep -q "access mode='shared'" \
+	    || { echo "[!] '$(VM)' n'a pas de backing mémoire partagée (aucun virtiofs) — redéploie avec SHARE=... (ou make full) puis réessaie"; exit 1; }; \
+	  tag="$(TAG)"; [ -n "$$tag" ] || tag="$$(basename '$(DST)')"; \
+	  if LC_ALL=C virsh -c qemu:///system dumpxml $(VM) | grep -q "target dir='$$tag'"; then \
+	    echo "[!] le tag '$$tag' est déjà partagé sur $(VM) — choisis un autre DST/TAG"; exit 1; fi; \
+	  mkdir -p "$(DIR)"; \
+	  tmp="$$(mktemp)"; \
+	  { echo "<filesystem type='mount' accessmode='passthrough'>"; \
+	    echo "  <driver type='virtiofs'/>"; \
+	    echo "  <source dir='$(DIR)'/>"; \
+	    echo "  <target dir='$$tag'/>"; \
+	    echo "</filesystem>"; } > "$$tmp"; \
+	  echo ">> attaching virtiofs: $(DIR) -> $(DST) (tag $$tag) on $(VM)  [live, not persisted]"; \
+	  virsh -c qemu:///system attach-device $(VM) "$$tmp" --live; rm -f "$$tmp"; \
+	  $(LIVE_IP); \
+	  if [ -n "$$ip" ]; then \
+	    ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 $(SSH_USER)@$$ip \
+	      "sudo -n mkdir -p '$(DST)' && sudo -n mount -t virtiofs '$$tag' '$(DST)'" 2>/dev/null \
+	      && echo ">> mounted in guest: $$tag -> $(DST)" \
+	      || echo "[i] device attached; in the guest run: sudo mkdir -p $(DST) && sudo mount -t virtiofs $$tag $(DST)"; \
+	  else echo "[i] device attached; no guest IP — mount manually: sudo mount -t virtiofs $$tag $(DST)"; fi; \
+	  echo ">> to persist across redeploys, use: make deploy VM=$(VM) ... SHARE2=\"$(DIR)\""
 
 # ---- Export a portable copy of a qcow2 image --------------------------------
 # Flattens the backing chain into a standalone qcow2 (qemu-img convert), then:

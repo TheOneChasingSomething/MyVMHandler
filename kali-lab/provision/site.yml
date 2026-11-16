@@ -36,6 +36,10 @@
     git_repos: []
     env_path: []
     openvpn: {}
+    # Absolute HOST path to the .ovpn, injected from .env via `-e vpn_ovpn=...`
+    # (see Makefile). It is kept OUT of the versioned profiles on purpose; when
+    # set it overrides openvpn.config, so the secret path never lives in Git.
+    vpn_ovpn: ""
     vpn_killswitch: false
     lan_cidr: "192.168.122.0/24"
     docker_run: []
@@ -199,6 +203,17 @@
         label: "{{ item.url }}"
       when: not (item.unarchive | default(false))
 
+    # The unarchive module needs the matching extractor on the target. A lean
+    # golden (kali-linux-core/headless) ships tar but NOT unzip, so extracting a
+    # .zip (e.g. Ghidra) fails with "Unable to find required 'unzip'...". Install
+    # it first whenever a profile has any unarchive download.
+    - name: Ensure unzip is present for extracting archives
+      ansible.builtin.apt:
+        name: unzip
+        state: present
+        update_cache: true
+      when: (downloads | selectattr('unarchive', 'defined') | selectattr('unarchive') | list | length) > 0
+
     - name: Download and extract archives
       ansible.builtin.unarchive:
         src: "{{ item.url }}"
@@ -244,24 +259,30 @@
       when: env_path | length > 0
 
     # ---- OpenVPN ----------------------------------------------------------
+    # Effective .ovpn path: the .env-injected `vpn_ovpn` wins (secret, unversioned),
+    # else a profile's own openvpn.config (back-compat). Empty => VPN skipped.
+    - name: Resolve the effective OpenVPN config path
+      ansible.builtin.set_fact:
+        ovpn_config_effective: "{{ vpn_ovpn if (vpn_ovpn | default('') | length > 0) else (openvpn.config | default('')) }}"
+
     - name: Check the .ovpn exists on the controller
       ansible.builtin.stat:
-        path: "{{ openvpn.config }}"
+        path: "{{ ovpn_config_effective }}"
       delegate_to: localhost
       become: false
       register: ovpn_stat
-      when: openvpn.config is defined
+      when: ovpn_config_effective | length > 0
 
     - name: Warn when the .ovpn is missing (VPN skipped)
       ansible.builtin.debug:
-        msg: "[skip] openvpn.config '{{ openvpn.config }}' not found on the controller — OpenVPN not configured."
+        msg: "[skip] OpenVPN config '{{ ovpn_config_effective }}' not found on the controller — OpenVPN not configured."
       when:
-        - openvpn.config is defined
+        - ovpn_config_effective | length > 0
         - not (ovpn_stat.stat.exists | default(false))
 
     - name: Configure an OpenVPN client
       when:
-        - openvpn.config is defined
+        - ovpn_config_effective | length > 0
         - ovpn_stat.stat.exists | default(false)
       block:
         - name: Install openvpn
@@ -270,7 +291,7 @@
             state: present
         - name: Copy the .ovpn profile
           ansible.builtin.copy:
-            src: "{{ openvpn.config }}"
+            src: "{{ ovpn_config_effective }}"
             dest: "/etc/openvpn/client/lab.conf"
             mode: "0600"
         # Full-tunnel vs split-tunnel:
