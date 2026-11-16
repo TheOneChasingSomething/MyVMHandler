@@ -24,3 +24,5 @@ venv/
 
 # Golden image
 *.qcow2
+.env
+kali-lab/.env

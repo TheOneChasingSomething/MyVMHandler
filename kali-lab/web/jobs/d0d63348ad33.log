@@ -1,0 +1,7 @@
+$ make gui VM=bento BINARY=chromium
+
+make[1]: Entering directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'
+>> chromium via X11 on kali@192.168.122.254 (window opens on your screen)
+zsh:1: command not found: chromium
+make[1]: *** [Makefile:450: gui] Error 127
+make[1]: Leaving directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'

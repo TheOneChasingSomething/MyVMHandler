@@ -176,6 +176,13 @@ ACTIONS: list[Action] = [
     ("20", "Reset a VM (keep /data)", "reset", [p_vm], True),
     ("w", "Open the web console (VirtualBox-style GUI)", "web", [], False),
     ("pi", "Init/repair the libvirt storage pool", "pool-init", [], False),
+    ("rn", "Rename a VM in place (domain + volumes, disks kept)", "rename",
+        [p_text("OLD", "current VM name", ""), p_text("NEW", "new VM name", "")], False),
+    ("hw", "Change RAM/vCPU in place (stop -> set -> start -> info)", "set-hw",
+        [p_vm, p_opt("MEM", "RAM MiB"), p_opt("VCPU", "vCPU count")], True),
+    ("gd", "Grow a disk (data | root | root-redeploy)", "grow-disk",
+        [p_vm, p_text("DISK_TARGET", "disque: data|root|root-redeploy", "data"),
+         p_text("SIZE", "nouvelle taille GiB", "")], True),
 ]
 
 

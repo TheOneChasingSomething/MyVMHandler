@@ -59,6 +59,9 @@
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
   label{font-size:13px;color:var(--mut);min-width:84px}
   .pill{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2);color:var(--mut)}
+  .preset{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel2);cursor:pointer}
+  .preset:has(input:checked){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--panel2))}
+  .preset input{margin:0}
   .pill.running{color:var(--ok)} .pill.paused{color:var(--warn)}
   .empty{color:var(--mut);padding:40px;text-align:center}
   /* modal */
@@ -138,6 +141,12 @@ async function refresh(){
   renderList();
   if(state.sel && state.view==="vm") await selectVM(state.sel,true);
 }
+// Lightweight periodic refresh: update the VM list (states/dots) only, WITHOUT
+// re-rendering the open detail pane — otherwise it wipes form inputs the user is
+// filling in (disk size, presets, snapshot name).
+async function refreshList(){
+  try{ state.vms = await api("GET","/api/vms"); renderList(); }catch(e){}
+}
 function stateClass(s){return s==="running"?"running":(s==="paused"?"paused":"shut");}
 function renderList(){
   const el=$("#vmlist");
@@ -174,6 +183,7 @@ function renderVM(){
       <button onclick="act('poweroff')" ${running?"":"disabled"}>⏹ Power off</button>
       <button onclick="openProvision()">⚙ Provision</button>
       <button onclick="openShare()">📁 Share</button>
+      <button onclick="openGui()" ${running?"":"disabled"}>🖥 GUI app</button>
       <button onclick="openRename()">✎ Rename</button>
       <button class="danger" onclick="openDelete()">🗑 Delete</button>
       <span style="width:1px;background:var(--line);align-self:stretch;margin:0 2px"></span>
@@ -240,13 +250,29 @@ function renderTab(){
   } else if(state.tab==="hardware"){
     b.innerHTML=`
       <div class="card"><h3>CPU &amp; memory</h3>
-        <div class="row"><label>vCPU</label><input id="cfgv" type="number" min="1" max="64" value="${esc(d.vcpu)}" style="width:90px">
+        <div class="sub" style="margin-bottom:8px">Current: <b>${esc(d.vcpu)}</b> vCPU · <b>${esc(d.memoryMiB)}</b> MiB max (${esc(d.currentMemoryMiB)} MiB live) · CPU mode ${esc(d.cpuMode)}</div>
+        <div class="row" style="flex-wrap:wrap;gap:12px">
+          ${Object.entries(HW_PRESETS).map(([k,p])=>`<label class="preset"><input type="radio" name="hwpreset" value="${k}" onchange="selPreset('${k}')"> <b>${p.label}</b> <span class="sub">${p.note}</span></label>`).join("")}
+        </div>
+        <div class="row" style="margin-top:12px"><label>vCPU</label><input id="cfgv" type="number" min="1" max="64" value="${esc(d.vcpu)}" style="width:80px">
           <label>Memory MiB</label><input id="cfgm" type="number" min="256" step="256" value="${esc(d.memoryMiB)}" style="width:120px">
           <button class="pri" onclick="applyConfig()">Apply</button></div>
-        <div class="sub">CPU mode: ${esc(d.cpuMode)}. Raising above the boot-time maximum needs a redeploy (MEM=/VCPU=).</div>
+        <div class="sub">A preset just fills the fields. <b>Memory is in MiB</b> (4 GiB = 4096, not 4). Apply runs <code>make set-hw</code>: it <b>stops and restarts</b> the VM to set the new maximum in place (root + /data kept). A later <code>make deploy</code> resets it to the profile/.env values.</div>
       </div>
-      <div class="card"><h3>Disks</h3><table><tr><th>Target</th><th>Bus</th><th>Type</th><th>Source</th></tr>
-        ${(d.disks||[]).map(x=>`<tr><td>${esc(x.target)}</td><td>${esc(x.bus)}</td><td>${esc(x.device)}/${esc(x.driver)}</td><td><code>${esc(x.source)}</code></td></tr>`).join("")}</table></div>
+      <div class="card"><h3>Disks</h3><table><tr><th>Target</th><th>Bus</th><th>Type</th><th>Virtual</th><th>Allocated</th><th>Source</th></tr>
+        ${(d.disks||[]).map(x=>`<tr><td>${esc(x.target)}</td><td>${esc(x.bus)}</td><td>${esc(x.device)}/${esc(x.driver)}</td><td>${fmtB(x.virtualBytes)}</td><td>${fmtB(x.allocatedBytes)}</td><td><code>${esc(x.source)}</code>${x.backing?`<br><span class="sub">↳ backing: ${esc(x.backing)}</span>`:""}</td></tr>`).join("")}</table>
+        <div class="sub">Virtual = capacité max annoncée au guest ; Allocated = occupation réelle sur disque (qcow2 = allocation paresseuse).</div>
+        <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:12px">
+          <b>Grow a disk</b>
+          <div class="row" style="flex-wrap:wrap;gap:12px;margin-top:8px">
+            <label class="preset"><input type="radio" name="growtgt" value="data" checked> <b>/data (vdb)</b> <span class="sub">online · data kept</span></label>
+            <label class="preset"><input type="radio" name="growtgt" value="root"> <b>root (vda)</b> <span class="sub">in place · growpart+resize2fs</span></label>
+            <label class="preset"><input type="radio" name="growtgt" value="root-redeploy"> <b>root redeploy</b> <span class="sub">recreates root · /data kept</span></label>
+          </div>
+          <div class="row" style="margin-top:10px"><label>New size GiB</label><input id="growsize" type="number" min="1" step="1" placeholder="e.g. 50" style="width:110px">
+            <button class="pri" onclick="growDisk()">Grow</button></div>
+          <div class="sub">Grow-only (never shrinks). The host disk must have the free space — a full host is what truncates files.</div>
+        </div></div>
       <div class="card"><h3>Network</h3><table><tr><th>Model</th><th>MAC</th><th>Network</th></tr>
         ${(d.nics||[]).map(x=>`<tr><td>${esc(x.model)}</td><td><code>${esc(x.mac)}</code></td><td>${esc(x.network)}</td></tr>`).join("")}</table></div>
       <div class="card"><h3>Shared folders (virtiofs)</h3>${(d.shares||[]).length?`<table><tr><th>Tag</th><th>Host source</th></tr>
@@ -277,11 +303,49 @@ async function act(a){
   toast(r.ok?a+" ok":("error: "+(r.output||r.error||"")));
   setTimeout(refresh,800);
 }
-async function applyConfig(){
-  const body={memoryMiB:parseInt($("#cfgm").value,10), vcpu:parseInt($("#cfgv").value,10)};
-  const r=await api("POST","/api/vm/"+encodeURIComponent(state.sel)+"/config",body);
-  toast(r.ok?"config applied":("error: "+(r.output||r.error)));
-  setTimeout(()=>selectVM(state.sel,true),500);
+// Hardware presets (MEM in MiB) — selecting one just fills the fields below.
+const HW_PRESETS={
+  low:    {MEM:2048,  VCPU:2, label:"Low",    note:"2 GiB · 2 vCPU"},
+  middle: {MEM:4096,  VCPU:4, label:"Middle", note:"4 GiB · 4 vCPU"},
+  high:   {MEM:8192,  VCPU:6, label:"High",   note:"8 GiB · 6 vCPU"},
+  max:    {MEM:16384, VCPU:8, label:"Max",    note:"16 GiB · 8 vCPU"},
+};
+function selPreset(k){
+  const p=HW_PRESETS[k]; if(!p)return;
+  const m=$("#cfgm"), v=$("#cfgv");
+  if(m) m.value=p.MEM;
+  if(v) v.value=p.VCPU;
+}
+function fmtB(b){
+  if(b==null) return "—";
+  if(b>=1073741824) return (b/1073741824).toFixed(1)+" GiB";
+  if(b>=1048576)    return (b/1048576).toFixed(1)+" MiB";
+  if(b>=1024)       return (b/1024).toFixed(0)+" KiB";
+  return b+" B";
+}
+function applyConfig(){
+  const mem=($("#cfgm").value||"").trim(), vc=($("#cfgv").value||"").trim();
+  if(!mem && !vc){ toast("set memory and/or vCPU"); return; }
+  if(mem && parseInt(mem,10)<256){ toast("Memory is in MiB — 256 minimum (4 GiB = 4096)"); return; }
+  if(!confirm("Apply "+(mem?mem+" MiB":"")+(mem&&vc?" / ":"")+(vc?vc+" vCPU":"")+" to "+state.sel+"?\n\nThis STOPS and restarts the VM (root + /data are kept).")) return;
+  const vars={VM:state.sel};
+  if(mem) vars.MEM=mem;
+  if(vc)  vars.VCPU=vc;
+  doMake("set-hw",vars,"set-hw "+state.sel);
+}
+function growDisk(){
+  const size=($("#growsize").value||"").trim();
+  const sel=document.querySelector('input[name="growtgt"]:checked');
+  const tgt=sel?sel.value:"data";
+  if(!size || parseInt(size,10)<1){ toast("enter a new size in GiB"); return; }
+  const notes={
+    data:"Grows /data (vdb) online — data kept.",
+    root:"Grows the root disk (vda) in place: host blockresize + growpart/resize2fs in the guest.",
+    "root-redeploy":"RECREATES the root on a "+size+" GiB disk (root wiped, /data reattached)."
+  };
+  if(!confirm("Grow "+state.sel+" → "+size+" GiB?\n\n"+notes[tgt])) return;
+  const vars={VM:state.sel, DISK_TARGET:tgt, SIZE:size};
+  doMake("grow-disk",vars,"grow-disk "+tgt+" "+state.sel+" → "+size+"G");
 }
 async function takeSnap(){
   const name=$("#snapname").value.trim(); if(!name)return;
@@ -301,16 +365,19 @@ async function delSnap(n){
 
 // ---- dialogs ----
 function openRename(){
-  modal(`<h3>Rename / move ${esc(state.sel)}</h3>
+  modal(`<h3>Rename ${esc(state.sel)}</h3>
     <div class="row"><label>New name</label><input id="rn" value="${esc(state.sel)}"></div>
-    <div class="sub">Renames the libvirt domain (the VM must be shut off).</div>
+    <div class="sub">Runs <code>make rename</code>: renames the libvirt domain <b>and its volumes</b>
+      (.qcow2 / -data.raw / cloud-init), keeping the disks. The VM must be <b>shut off</b> first
+      (use Shutdown) — the job aborts if it is still running.</div>
     <div class="actions"><button onclick="closeModal()">Cancel</button>
       <button class="pri" onclick="doRename()">Rename</button></div>`);
 }
-async function doRename(){
-  const nn=$("#rn").value.trim();
-  const r=await api("POST","/api/vm/"+encodeURIComponent(state.sel)+"/rename",{newName:nn});
-  closeModal(); if(r.ok){state.sel=nn;toast("renamed");refresh();}else toast("error: "+(r.output||r.error));
+function doRename(){
+  const nn=($("#rn").value||"").trim();
+  if(!nn || nn===state.sel){ toast("enter a different name"); return; }
+  doMake("rename",{OLD:state.sel, NEW:nn},"rename "+state.sel+" → "+nn);
+  state.sel=nn;   // follow the VM under its new name once the job finishes
 }
 function openDelete(){
   modal(`<h3>Delete ${esc(state.sel)}</h3>
@@ -342,6 +409,32 @@ function doShare(){
   const tag=$("#shtag").value.trim(); if(tag)vars.TAG=tag;
   if(!vars.DIR){toast("host dir required");return;}
   doMake("share",vars,"share "+state.sel);
+}
+async function openGui(){
+  const r = await api("GET","/api/vm/"+encodeURIComponent(state.sel)+"/gui-apps");
+  if(!r.reachable){
+    modal(`<h3>GUI app on ${esc(state.sel)}</h3><p class="sub">VM offline — start it first.</p>
+      <div class="actions"><button onclick="closeModal()">Close</button></div>`); return;
+  }
+  const apps = r.apps||[];
+  const list = apps.length
+    ? apps.map(a=>`<label style="display:flex;gap:8px;align-items:center;min-width:0">
+        <input type="checkbox" value="${esc(a)}"> ${esc(a)}</label>`).join("")
+    : '<div class="sub">No known GUI app detected in this VM — use the field below.</div>';
+  modal(`<h3>Launch a GUI app on ${esc(state.sel)}</h3>
+    <p class="sub">Runs <code>make gui</code> over SSH X11 — the window opens on the host display where <code>make web</code> is running. Pick one or more:</p>
+    <div id="guiList" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:240px;overflow:auto;margin-bottom:10px">${list}</div>
+    <div class="row"><label>Other</label><input id="guiCustom" placeholder="binary name, e.g. ghidra" style="flex:1"></div>
+    <div class="actions"><button onclick="closeModal()">Cancel</button>
+      <button class="pri" onclick="launchGui()">Launch</button></div>`);
+}
+function launchGui(){
+  const sel=[...document.querySelectorAll('#guiList input:checked')].map(c=>c.value);
+  const custom=($("#guiCustom").value||"").trim();
+  if(custom) sel.push(custom);
+  if(!sel.length){ toast("select or type an app"); return; }
+  closeModal();
+  sel.forEach(app => doMake("gui",{VM:state.sel, BINARY:app}, "gui "+app));
 }
 function openNew(){
   api("GET","/api/profiles").then(ps=>{
@@ -419,7 +512,7 @@ async function saveProfile(){
 }
 
 refresh();
-setInterval(()=>{if(!state.jobTimer)refresh();},10000);
+setInterval(()=>{if(!state.jobTimer)refreshList();},10000);
 </script>
 </body>
 </html>

@@ -1,0 +1,39 @@
+$ make set-hw VM=bento MEM=8192 VCPU=6
+
+make[1]: Entering directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'
+>> arrêt de bento…
+>> mémoire -> 8192 MiB
+
+
+>> vCPU -> 6
+
+
+>> redémarrage de bento…
+Domain 'bento' started
+
+== Provenance de bento ==
+-- description libvirt (manifeste du golden + notes 'make note') --
+golden=kali-desktop | os=Kali 2026.2 | kernel=6.19.14+kali-amd64 | upgradable@bake=0 | built=2026-10-17T11:02:34Z | commit=96484dc
+
+-- /etc/kali-lab-build.json embarqué (si la VM répond) --
+
+-- hardware (defined — host view) --
+  State:          running
+  CPU(s):         6
+  CPU time:       6.8s
+  Max memory:     8388608 KiB
+  Used memory:    8388608 KiB
+  disks:
+     vda      bento.qcow2
+     vdb      /var/lib/libvirt/images/bento-data.raw
+     hdd      /var/lib/libvirt/images/bento-cloudinit.iso
+  nics:
+     vnet7       network   default   virtio   52:54:00:3e:39:24
+  shares (virtiofs):
+    <filesystem type='mount' accessmode='passthrough'>
+    <source dir='/home/fjo/Documents/7_-_Projets'/>
+    <target dir='hostshare'/>
+
+-- hardware (detected by guest — QEMU agent) --
+  (guest agent unavailable — use 'make ssh VM=bento' then lscpu / free -h / lsblk)
+make[1]: Leaving directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'

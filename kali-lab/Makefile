@@ -43,12 +43,18 @@ BINARY     ?=
 WORKLIST   ?= work/$(VM).apps
 VM         ?= kali-lab-01
 FORCE      ?=
+RETRIES    ?= 3
+ATIMEOUT   ?= 30
+OLD        ?=
+NEW        ?=
 SNAP       ?= clean
 MEM        ?= 4096
 VCPU       ?= 2
 DISK       ?= 30
 DATA       ?= false
 DATA_GB    ?= 10
+DISK_TARGET ?= data
+SIZE       ?=
 SRC        ?= $(VM)
 SPICE      ?= true
 SHARE      ?= $(CURDIR)/shared
@@ -128,7 +134,7 @@ help:
 	@echo
 else
 
-.PHONY: help check fix-apparmor pool-init ensure-virtiofsd ensure-golden tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui web reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-resize data-delete apps-save apps-restore info provenance disk gc note share export
+.PHONY: help check fix-apparmor pool-init ensure-virtiofsd ensure-golden tools hooks ensure-terraform venv iso bake install deploy provision ip ssh gui work smoke all full tui web reset start stop reboot restart status autostart snapshot snapshots revert snapshot-delete destroy clean validate data-create data-resize data-delete apps-save apps-restore info provenance disk gc note share rename set-hw grow-disk export FORCE
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -400,17 +406,32 @@ deploy: ensure-terraform pool-init ## Deploy a VM (VM=<name> → workspace; DATA
 provision: ## Apply a lab profile to a deployed VM over SSH (PROFILE=, Ansible)
 #: Detail  : applies a declarative profile (provision/profiles/<name>.yml) to an
 #:           already-deployed VM over SSH, via Ansible. Idempotent and additive:
-#:           chaining profiles stacks the tools (e.g. full then v8).
+#:           chaining profiles stacks the tools (e.g. full then v8). Auto-retries
+#:           (RETRIES=3) on TRANSIENT errors only — privilege-escalation timeout,
+#:           UNREACHABLE, SSH connect fail; a real task failure is NOT retried.
+#:           ANSIBLE_TIMEOUT is raised to ATIMEOUT=30 to avoid slow-first-sudo timeouts.
 #: Params  : VM=<name>  PROFILE=research|pentest|cibles|ad|full|v8  SSH_USER=<user>
+#:           RETRIES=<n,3>  ATIMEOUT=<sec,30>
 #: Example : make provision VM=poste PROFILE=full
 	@test -f $(PROFILES_DIR)/$(PROFILE).yml || { echo "[!] $(PROFILES_DIR)/$(PROFILE).yml introuvable"; exit 1; }
 	@$(LIVE_IP); [ -n "$$ip" ] || { echo "[!] pas d'IP — VM démarrée ? 'make status'"; exit 1; }; \
 	  echo ">> Provisioning $(VM) ($$ip) avec le profil '$(PROFILE)'"; \
-	  $(ACTIVATE) && ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
-	    -i "$$ip," -u $(SSH_USER) \
-	    -e "ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'" \
-	    $(PROVISION_DIR)/site.yml -e @$(PROFILES_DIR)/$(PROFILE).yml \
-	    $(if $(strip $(VPN_OVPN)),-e vpn_ovpn='$(VPN_OVPN)')
+	  rcf="$$(mktemp)"; log="$$(mktemp)"; n=1; max=$(RETRIES); \
+	  while :; do \
+	    ( $(ACTIVATE) && ANSIBLE_HOST_KEY_CHECKING=False ANSIBLE_TIMEOUT=$(ATIMEOUT) ansible-playbook \
+	        -i "$$ip," -u $(SSH_USER) \
+	        -e "ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'" \
+	        $(PROVISION_DIR)/site.yml -e @$(PROFILES_DIR)/$(PROFILE).yml \
+	        $(if $(strip $(VPN_OVPN)),-e vpn_ovpn='$(VPN_OVPN)') ; echo $$? > "$$rcf" ) 2>&1 | tee "$$log"; \
+	    rc="$$(cat "$$rcf" 2>/dev/null)"; [ -n "$$rc" ] || rc=1; \
+	    [ "$$rc" = "0" ] && break; \
+	    if [ "$$n" -ge "$$max" ]; then echo "[!] provision: échec après $$n tentative(s)."; rm -f "$$rcf" "$$log"; exit "$$rc"; fi; \
+	    if grep -qE 'waiting for privilege escalation|UNREACHABLE!|Failed to connect to the host via ssh' "$$log"; then \
+	      n="$$((n+1))"; echo ">> erreur transitoire détectée (escalade/SSH) — nouvelle tentative $$n/$$max dans 5s… (idempotent)"; sleep 5; \
+	    else \
+	      echo "[!] provision: échec NON transitoire — pas de re-run auto (corrige la cause puis relance)."; rm -f "$$rcf" "$$log"; exit "$$rc"; \
+	    fi; \
+	  done; rm -f "$$rcf" "$$log"
 
 ip: ## Print the VM's current IP (guest agent → lease → TF output)
 	@$(LIVE_IP); echo "$$ip"
@@ -488,7 +509,11 @@ tui: ## Interactive text menu — asks what to do and runs the right make target
 #: Example : make tui
 	@python3 tui.py
 
-web: ## Launch the web console (VirtualBox-style control panel) on localhost
+# Always-out-of-date sentinel: depending on it forces a recipe to run every time,
+# even when the target name clashes with a real directory (here 'web' vs web/).
+FORCE:
+
+web: FORCE ## Launch the web console (VirtualBox-style control panel) on localhost
 #: Detail  : starts a dependency-free local web UI (web/server.py) wrapping virsh +
 #:           make: VM list / info / hardware, lifecycle, snapshots, memory & vCPU,
 #:           rename, delete, provision, live virtiofs share, VPN + kill-switch
@@ -599,6 +624,75 @@ destroy: ensure-terraform ## Destroy a VM (VM=<name> selects its workspace)
 	  && $(TF) destroy -auto-approve -var 'vm_name=$(VM)'; } \
 	  || echo "[!] pas de workspace Terraform '$(VM)' (rien à détruire côté TF)"
 
+rename: ## Rename a VM in place at the libvirt level — domain + volumes, both disks kept (OLD= NEW=)
+#: Detail  : in-place rename, no reprovision — renames the domain and its volumes
+#:           (<old>.qcow2, <old>-data.raw, <old>-cloudinit.iso -> <new>-*), rewrites the
+#:           domain XML, keeps BOTH disks (root + /data) and the MAC (so the IP/lease is
+#:           unchanged). The VM must be shut off; it is restarted so 'make ssh VM=<new>'
+#:           works right away. The guest's INTERNAL hostname stays <old> until you change
+#:           it in the guest (sudo hostnamectl set-hostname <new>).
+#:           NB: Terraform no longer tracks the VM afterwards (no <new> workspace), so a
+#:           later 'make deploy VM=<new>' would RECREATE it (the confirmation guard
+#:           protects you). For a Terraform-managed rename, recreate instead (README).
+#: Params  : OLD=<current name>  NEW=<new name>   (names: [A-Za-z0-9._-])
+#: Example : make rename OLD=bento NEW=recherche
+	@test -n "$(strip $(OLD))" && test -n "$(strip $(NEW))" || { echo "[!] OLD= et NEW= requis — ex: make rename OLD=bento NEW=recherche"; exit 1; }
+	@virsh -c qemu:///system dominfo $(OLD) >/dev/null 2>&1 || { echo "[!] domaine '$(OLD)' introuvable"; exit 1; }
+	@if virsh -c qemu:///system dominfo $(NEW) >/dev/null 2>&1; then echo "[!] '$(NEW)' existe déjà — choisis un autre nom"; exit 1; fi
+	@set -e; \
+	  st="$$(LC_ALL=C virsh -c qemu:///system domstate $(OLD) 2>/dev/null)"; \
+	  [ "$$st" != "running" ] || { echo "[!] éteins-la d'abord : make stop VM=$(OLD)"; exit 1; }; \
+	  dir="$$($(POOL_PATH))"; [ -n "$$dir" ] || { echo "[!] pool '$(POOL)' introuvable"; exit 1; }; \
+	  for suf in .qcow2 -data.raw -cloudinit.iso; do \
+	    if [ -f "$$dir/$(OLD)$$suf" ]; then echo ">> volume $(OLD)$$suf -> $(NEW)$$suf"; sudo mv "$$dir/$(OLD)$$suf" "$$dir/$(NEW)$$suf"; fi; \
+	  done; \
+	  virsh -c qemu:///system pool-refresh $(POOL) >/dev/null 2>&1 || true; \
+	  tmp="$$(mktemp)"; \
+	  virsh -c qemu:///system dumpxml --inactive $(OLD) \
+	    | sed -e "s#<name>$(OLD)</name>#<name>$(NEW)</name>#" \
+	          -e "s#$(OLD)\.qcow2#$(NEW).qcow2#g" \
+	          -e "s#$(OLD)-data\.raw#$(NEW)-data.raw#g" \
+	          -e "s#$(OLD)-cloudinit\.iso#$(NEW)-cloudinit.iso#g" \
+	          -e "s#<uuid>[^<]*</uuid>##" > "$$tmp"; \
+	  { virsh -c qemu:///system undefine $(OLD) --nvram 2>/dev/null || virsh -c qemu:///system undefine $(OLD); }; \
+	  virsh -c qemu:///system define "$$tmp"; rm -f "$$tmp"; \
+	  virsh -c qemu:///system start $(NEW); \
+	  echo ">> renommée (niveau libvirt) : $(OLD) -> $(NEW)"; \
+	  echo ">> alignement du hostname interne (best-effort, attente SSH jusqu'à ~60 s)…"; \
+	  ip=""; for i in $$(seq 1 30); do \
+	    ip=$$(virsh -c qemu:///system domifaddr $(NEW) --source agent 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); \
+	    [ -n "$$ip" ] || ip=$$(virsh -c qemu:///system domifaddr $(NEW) --source lease 2>/dev/null | awk '/ipv4/ && $$4 !~ /^127\./ {split($$4,a,"/");print a[1];exit}'); \
+	    if [ -n "$$ip" ] && ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(SSH_USER)@$$ip true 2>/dev/null; then break; fi; ip=""; sleep 2; \
+	  done; \
+	  if [ -n "$$ip" ]; then \
+	    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(SSH_USER)@$$ip "sudo hostnamectl set-hostname $(NEW) && sudo sed -i 's/$(OLD)/$(NEW)/g' /etc/hosts" 2>/dev/null \
+	      && echo "   hostname interne -> $(NEW)  (effectif au prochain shell ; le bail DHCP suivra)" \
+	      || echo "   [i] hostname interne inchangé (sudo ?) — dans la VM : sudo hostnamectl set-hostname $(NEW)"; \
+	  else echo "   [i] VM injoignable — hostname interne reste '$(OLD)'. make ssh VM=$(NEW) puis : sudo hostnamectl set-hostname $(NEW)"; fi; \
+	  echo ">> terminé.  Teste :  make ssh VM=$(NEW)"; \
+	  echo "   NB: Terraform ne suit plus cette VM ; un futur 'make deploy VM=$(NEW)' la recréerait (confirmation)."
+
+set-hw: ## Change a VM's RAM/vCPU in place: stop → set → start → info (keeps the root) (MEM= VCPU=)
+#: Detail  : lowers (or raises) memory and/or vCPU of an EXISTING VM without recreating
+#:           it. Stops it (graceful, then forced), applies setmaxmem/setmem (MEM in MiB)
+#:           and setvcpus (VCPU), restarts, then runs 'make info'. Root + /data kept.
+#:           Give at least MEM= or VCPU=. NB: drifts from Terraform — a later
+#:           'make deploy' resets it to the module/.env values.
+#: Params  : VM=<name>  MEM=<MiB>  VCPU=<n>
+#: Example : make set-hw VM=bento MEM=4096 VCPU=2
+	@test -n "$(strip $(MEM))$(strip $(VCPU))" || { echo "[!] donne au moins MEM= (MiB) ou VCPU="; exit 1; }
+	@virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1 || { echo "[!] domaine '$(VM)' introuvable"; exit 1; }
+	@set -e; \
+	  if [ "$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)" = "running" ]; then \
+	    echo ">> arrêt de $(VM)…"; virsh -c qemu:///system shutdown $(VM) >/dev/null 2>&1 || true; \
+	    for i in $$(seq 1 30); do [ "$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)" = "shut off" ] && break; sleep 1; done; \
+	    [ "$$(LC_ALL=C virsh -c qemu:///system domstate $(VM) 2>/dev/null)" = "shut off" ] || { echo ">> arrêt forcé"; virsh -c qemu:///system destroy $(VM) >/dev/null 2>&1 || true; sleep 1; }; \
+	  fi; \
+	  if [ -n "$(strip $(MEM))" ]; then echo ">> mémoire -> $(MEM) MiB"; virsh -c qemu:///system setmaxmem $(VM) $(MEM)M --config; virsh -c qemu:///system setmem $(VM) $(MEM)M --config; fi; \
+	  if [ -n "$(strip $(VCPU))" ]; then echo ">> vCPU -> $(VCPU)"; virsh -c qemu:///system setvcpus $(VM) $(VCPU) --config --maximum; virsh -c qemu:///system setvcpus $(VM) $(VCPU) --config; fi; \
+	  echo ">> redémarrage de $(VM)…"; virsh -c qemu:///system start $(VM)
+	@$(MAKE) --no-print-directory info VM=$(VM)
+
 # ---- Persistent data disk (survives destroy + redeploy onto a newer golden) ----
 # The image is a standalone raw volume that Terraform does NOT own; `make deploy
 # DATA=true` attaches it by path and cloud-init mounts it (by LABEL) on /data.
@@ -643,6 +737,43 @@ data-resize: ## Grow the persistent data disk to DATA_GB (online if the VM runs;
 	    echo "   [i] démarre la VM puis : sudo resize2fs /dev/vdb"; \
 	  fi
 
+grow-disk: ## Grow a VM disk — 3 variants (DISK_TARGET=data|root|root-redeploy  SIZE=<GiB>)
+#: Detail  : one entry point for the three ways to enlarge a VM's storage:
+#:             data          -> grow the persistent /data volume (vdb), online, data kept
+#:                              (delegates to data-resize; grow-only, never shrinks)
+#:             root          -> grow the root overlay (vda) IN PLACE: host blockresize,
+#:                              then growpart + resize2fs inside the running guest
+#:             root-redeploy -> recreate the root on a bigger disk via deploy (the root is
+#:                              disposable; /data is reattached). Asks for confirmation.
+#:           SIZE is the NEW size in GiB. The host LV must have the free space — check
+#:           `df -h /` first (a full LV is what truncates files).
+#: Params  : VM=<name>  DISK_TARGET=data|root|root-redeploy  SIZE=<GiB>  [GOLDEN= for redeploy]
+#: Example : make grow-disk VM=bento DISK_TARGET=data SIZE=50
+	@test -n "$(strip $(SIZE))" || { echo "[!] SIZE=<GiB> requis (nouvelle taille)"; exit 1; }
+	@case "$(DISK_TARGET)" in \
+	  data) \
+	    $(MAKE) --no-print-directory data-resize VM=$(VM) DATA_GB=$(SIZE) ;; \
+	  root) \
+	    set -e; \
+	    virsh -c qemu:///system dominfo $(VM) >/dev/null 2>&1 || { echo "[!] domaine '$(VM)' introuvable"; exit 1; }; \
+	    path=$$(virsh -c qemu:///system domblklist $(VM) 2>/dev/null | awk '$$1=="vda"{print $$2}'); \
+	    [ -n "$$path" ] || path=$$(virsh -c qemu:///system vol-path --pool $(POOL) $(VM).qcow2 2>/dev/null); \
+	    [ -n "$$path" ] || { echo "[!] overlay racine (vda) introuvable"; exit 1; }; \
+	    echo ">> blockresize racine $(VM) ($$path) -> $(SIZE)G"; \
+	    virsh -c qemu:///system blockresize $(VM) "$$path" $(SIZE)G; \
+	    $(LIVE_IP); \
+	    if [ -n "$$ip" ]; then \
+	      echo ">> extension partition + système de fichiers dans le guest…"; \
+	      ssh -o StrictHostKeyChecking=accept-new $(SSH_USER)@$$ip 'set -e; r=$$(findmnt -no SOURCE /); d="/dev/$$(lsblk -no pkname "$$r")"; n=$$(echo "$$r" | grep -o "[0-9]*$$"); sudo growpart "$$d" "$$n"; sudo resize2fs "$$r" 2>/dev/null || sudo xfs_growfs /' \
+	        && echo ">> racine agrandie à $(SIZE) GiB" \
+	        || echo "   [i] échec côté guest — dans la VM : sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1"; \
+	    else echo "   [i] VM injoignable — démarre-la puis, dans la VM : sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1"; fi ;; \
+	  root-redeploy) \
+	    echo ">> redéploiement de $(VM) sur un disque racine de $(SIZE) Go (root recréé, /data conservé)…"; \
+	    $(MAKE) --no-print-directory deploy VM=$(VM) DISK=$(SIZE) DATA=true GOLDEN=$(GOLDEN) ;; \
+	  *) echo "[!] DISK_TARGET inconnu '$(DISK_TARGET)' — attendu : data | root | root-redeploy"; exit 1 ;; \
+	esac
+
 data-delete: ## Delete the persistent data image (DESTROYS the /data content)
 	virsh -c qemu:///system vol-delete --pool $(POOL) $(VM)-data.raw
 	@echo ">> Disque de données supprimé : $(POOL)/$(VM)-data.raw"
@@ -684,6 +815,14 @@ info: ## Show a VM's provenance + hardware (libvirt description, hardware, live 
 	@echo "  disks:";  LC_ALL=C virsh -c qemu:///system domblklist $(VM) 2>/dev/null | sed '1,2d;/^$$/d;s/^/    /'
 	@echo "  nics:";   LC_ALL=C virsh -c qemu:///system domiflist  $(VM) 2>/dev/null | sed '1,2d;/^$$/d;s/^/    /'
 	@echo "  shares (virtiofs):"; LC_ALL=C virsh -c qemu:///system dumpxml $(VM) 2>/dev/null | grep -E "<filesystem|source dir=|target dir=" | sed 's/^[[:space:]]*/    /' || true
+	@# ---- image sizes (qcow2: virtual capacity vs real on-disk allocation) ----
+	@echo "  image sizes (virtual vs allocated on disk):"; \
+	  for src in $$(LC_ALL=C virsh -c qemu:///system domblklist $(VM) 2>/dev/null | awk 'NR>2 && $$2 ~ /^\// {print $$2}'); do \
+	    echo "    $$src"; \
+	    LC_ALL=C virsh -c qemu:///system vol-info --bytes "$$src" 2>/dev/null \
+	      | awk -F: '/Capacity|Allocation/{v=$$2; gsub(/[^0-9]/,"",v); if(v!="") printf "      %-11s %.1f GiB\n", ($$1=="Capacity"?"virtual":"alloué")":", v/1073741824}' \
+	      || echo "      (vol-info indisponible)"; \
+	  done
 	@# ---- hardware, guest view (detected via the QEMU agent, no SSH) ----
 	@echo; echo "-- hardware (detected by guest — QEMU agent) --"
 	@out=$$(LC_ALL=C virsh -c qemu:///system guestinfo $(VM) 2>/dev/null); \

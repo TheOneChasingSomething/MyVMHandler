@@ -1,0 +1,5 @@
+$ make gui VM=bento BINARY=code-insiders
+
+make[1]: Entering directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'
+>> code-insiders via X11 on kali@192.168.122.254 (window opens on your screen)
+make[1]: Leaving directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'

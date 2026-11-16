@@ -1,0 +1,9 @@
+$ make gui VM=bento BINARY=firefox
+
+make[1]: Entering directory '/home/fjo/git/github.com/MyVMHandler/kali-lab'
+>> firefox via X11 on kali@192.168.122.254 (window opens on your screen)
+Gtk-Message: 21:34:20.947: Failed to load module "canberra-gtk-module"
+Gtk-Message: 21:34:20.950: Failed to load module "canberra-gtk-module"
+[Parent 10347, Main Thread] WARNING: unable to open file '/etc/dconf/db/local': Failed to open file “/etc/dconf/db/local”: open() failed: No such file or directory; expect degraded performance: 'glib warning', file toolkit/xre/nsSigHandlers.cpp:200
+
+(firefox-esr:10347): dconf-WARNING **: 21:34:21.434: unable to open file '/etc/dconf/db/local': Failed to open file “/etc/dconf/db/local”: open() failed: No such file or directory; expect degraded performance

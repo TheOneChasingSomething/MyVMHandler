@@ -37,6 +37,7 @@ VIRSH = ["virsh", "-c", "qemu:///system"]
 HOST = os.environ.get("KL_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KL_WEB_PORT", "8674"))
 SSH_USER = os.environ.get("KL_SSH_USER", "kali")
+POOL = os.environ.get("KL_POOL", "default")
 # Optional explicit systemd unit names; empty => discover them in the guest.
 VPN_UNIT_ENV = os.environ.get("KL_VPN_UNIT", "")
 KS_UNIT_ENV = os.environ.get("KL_KS_UNIT", "")
@@ -47,6 +48,7 @@ MAKE_TARGETS = {
     "deploy", "full", "provision", "data-create", "data-resize", "data-delete",
     "reset", "destroy", "share", "snapshot", "revert", "snapshot-delete",
     "install", "bake", "start", "stop", "restart", "gui",
+    "set-hw", "rename", "grow-disk", "data-resize",
 }
 # Candidate GUI apps offered in the web UI's "GUI app" picker; filtered to those
 # actually installed in the guest. The UI also accepts a free-text binary name.
@@ -76,6 +78,10 @@ VAR_PATTERNS = {
     "DIR": r"^[A-Za-z0-9 ._/~+-]{1,256}$",
     "DST": r"^/[A-Za-z0-9 ._/+-]{1,128}$",
     "TAG": r"^[A-Za-z0-9._-]{1,32}$",
+    "OLD": r"^[A-Za-z0-9._-]{1,64}$",
+    "NEW": r"^[A-Za-z0-9._-]{1,64}$",
+    "DISK_TARGET": r"^(data|root|root-redeploy)$",
+    "SIZE": r"^[0-9]{1,5}$",
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -102,6 +108,39 @@ def run(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
 
 def virsh(*args: str, timeout: int = 30) -> tuple[int, str, str]:
     return run(VIRSH + list(args), timeout=timeout)
+
+
+def vol_sizes(path: str) -> dict:
+    """virtual (capacity) and allocated (real on-disk) bytes for an image, plus
+    its backing file. Asked to libvirtd via `virsh vol-info`, so it works without
+    read permission on /var/lib/libvirt/images (the daemon reads it for us) and
+    resolves pool-volume references too. Best-effort — returns {} on any failure."""
+    if not path:
+        return {}
+    rc, out, _ = virsh("vol-info", "--bytes", path)
+    if rc != 0:
+        rc, out, _ = virsh("vol-info", "--bytes", "--pool", POOL, path)
+        if rc != 0:
+            return {}
+    res: dict = {}
+    for line in out.splitlines():
+        k, _, v = line.partition(":")
+        k = k.strip().lower()
+        # virsh prints "53687091200 bytes" even with --bytes, so take the leading number.
+        mnum = re.match(r"\s*(\d+)", v)
+        if not mnum:
+            continue
+        n = int(mnum.group(1))
+        if k == "capacity":
+            res["virtualBytes"] = n
+        elif k == "allocation":
+            res["allocatedBytes"] = n
+    rc2, bx, _ = virsh("vol-dumpxml", path)
+    if rc2 == 0:
+        m = re.search(r"<backingStore>.*?<path>(.*?)</path>", bx, re.S)
+        if m:
+            res["backing"] = m.group(1)
+    return res
 
 
 # --- libvirt reads -----------------------------------------------------------
@@ -143,21 +182,38 @@ def vm_detail(name: str) -> dict:
     d["cpuMode"] = cpu.get("mode") if cpu is not None else None
     d["machine"] = osn.get("machine") if osn is not None else None
     d["arch"] = osn.get("arch") if osn is not None else None
-    # disks
+    # disks — resolve each target to an absolute path via domblklist, which
+    # dereferences pool-volume refs (e.g. 'bento.qcow2') that the XML stores by name.
+    blk = {}
+    _, blout, _ = virsh("domblklist", name)
+    for line in blout.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].startswith("/"):
+            blk[parts[0]] = parts[1]
     disks = []
     for di in root.findall("devices/disk"):
         src = di.find("source")
         tgt = di.find("target")
+        target = tgt.get("dev") if tgt is not None else ""
         path = ""
         if src is not None:
             path = src.get("file") or src.get("volume") or src.get("dev") or ""
-        disks.append({
+        # resolve to an absolute path: domblklist first, else vol-path for a
+        # bare pool-volume name (e.g. 'kali01.qcow2') that the XML stores by name.
+        resolved = blk.get(target) or (path if path.startswith("/") else "")
+        if not resolved and path and not path.startswith("/"):
+            rc_vp, vp, _ = virsh("vol-path", "--pool", POOL, path)
+            if rc_vp == 0 and vp.strip().startswith("/"):
+                resolved = vp.strip()
+        entry = {
             "device": di.get("device"),
-            "target": tgt.get("dev") if tgt is not None else "",
+            "target": target,
             "bus": tgt.get("bus") if tgt is not None else "",
-            "source": path,
+            "source": resolved or path,
             "driver": (di.find("driver").get("type") if di.find("driver") is not None else ""),
-        })
+        }
+        entry.update(vol_sizes(resolved or path))
+        disks.append(entry)
     d["disks"] = disks
     # nics
     nics = []
@@ -324,7 +380,7 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 
-def start_job(label: str, args: list[str]) -> str:
+def start_job(label: str, args: list[str], extra_env: dict | None = None) -> str:
     jid = uuid.uuid4().hex[:12]
     logf = WEB_DIR / "jobs"
     logf.mkdir(exist_ok=True)
@@ -338,8 +394,11 @@ def start_job(label: str, args: list[str]) -> str:
             fh.write(f"$ {' '.join(args)}\n\n")
             fh.flush()
             try:
+                env = dict(os.environ, LC_ALL="C")
+                if extra_env:
+                    env.update(extra_env)
                 p = subprocess.Popen(args, cwd=str(REPO),
-                                     env=dict(os.environ, LC_ALL="C"),
+                                     env=env,
                                      stdout=fh, stderr=subprocess.STDOUT, text=True)
                 rc = p.wait()
             except Exception as e:  # noqa: BLE001
@@ -387,6 +446,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # quieter
         pass
+
+    def handle_one_request(self):
+        # A browser closing a tab mid-response raises BrokenPipe/ConnectionReset;
+        # that is normal client behaviour, not a server fault — swallow the noise.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     # helpers
     def _send(self, code: int, body: bytes, ctype: str):
@@ -571,7 +638,16 @@ class Handler(BaseHTTPRequestHandler):
             built = build_make(target, variables)
             if isinstance(built, str):
                 return self._json({"error": built}, 400)
-            jid = start_job(f"make {target}", built)
+            # `make gui` forwards an X11 window to the host's display via ssh -Y; the
+            # detached job needs DISPLAY + the X cookie, which an interactive shell has
+            # but a background worker may not. Best-effort: inherit, else default to :0.
+            extra_env = None
+            if target == "gui":
+                extra_env = {
+                    "DISPLAY": os.environ.get("DISPLAY") or ":0",
+                    "XAUTHORITY": os.environ.get("XAUTHORITY") or str(Path.home() / ".Xauthority"),
+                }
+            jid = start_job(f"make {target}", built, extra_env=extra_env)
             return self._json({"job": jid})
 
         return self._json({"error": "not found"}, 404)

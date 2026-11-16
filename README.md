@@ -123,6 +123,32 @@ make status VM=lab                   # state + IP
 make stop VM=lab                     # graceful shutdown
 ```
 
+> **Rename a VM.** `make rename OLD=<a> NEW=<b>` renames it in place at the libvirt
+> level — domain + volumes (`<a>.qcow2`, `<a>-data.raw`, `<a>-cloudinit.iso` → `<b>-*`)
+> — keeping both disks and the MAC/IP, no reprovision; then `make ssh VM=<b>` works. The
+> VM must be shut off. After the restart it also aligns the guest's **internal
+> hostname** to `<b>` over SSH, best-effort (it waits up to ~60 s for SSH; if the VM
+> stays unreachable it leaves the hostname at `<a>` and prints how to set it by hand:
+> `sudo hostnamectl set-hostname <b>`). Note: Terraform stops tracking it (a later
+> `make deploy VM=<b>` would recreate it). For a fully Terraform-managed rename,
+> recreate under the new name carrying `/data` instead.
+
+> **Change RAM / vCPU in place.** `make set-hw VM=<name> MEM=<MiB> VCPU=<n>` (give at
+> least one of `MEM=` / `VCPU=`) lowers or raises a VM's memory and/or CPU count without
+> recreating it: it stops the VM, sets the new boot-time **maximum** (`setmaxmem` +
+> `setmem`, `setvcpus --maximum`), restarts it, and prints `make info`. The root and
+> `/data` are kept. `MEM` is in **MiB** (4 GiB = `4096`, not `4`). This drifts from
+> Terraform — a later `make deploy` resets the VM to the profile/`.env` values. Also
+> available from the TUI (`hw`) and the web console (Hardware tab → pick a preset
+> **Low / Middle / High / Max**, or type values, then **Apply**). `make info` now also
+> reports each image's **virtual vs allocated** size (qcow2 is thin-provisioned).
+
+> **Safety.** `deploy`, `full`, `reset` and `destroy` **ask for confirmation** when
+> `VM=<name>` already exists, because they reset the VM's root (the `<vm>-data.raw`
+> data disk is always kept). Pass `FORCE=yes` to skip the prompt (scripts / intentional
+> rebuilds); a non-interactive run also requires `FORCE=yes`. A fresh VM is never
+> prompted. Still, snapshot anything precious first: `make snapshot VM=<vm> SNAP=clean`.
+
 Any target's full help (parameters + example) is available inline:
 
 ```bash
@@ -210,11 +236,18 @@ make provision VM=rev PROFILE=full     # offensive toolkit + RE + AD + Ghidra + 
 make provision VM=rev PROFILE=v8       # then add a V8 checkout + d8 build on /data
 ```
 
-### Growing a data disk in place (no rebuild, no Terraform drift)
+### Growing a disk — one command, three variants
 
 ```bash
-make data-resize VM=rev DATA_GB=60     # online if the VM runs; grow-only
+make grow-disk VM=rev DISK_TARGET=data          SIZE=60   # /data (vdb), online, data kept
+make grow-disk VM=rev DISK_TARGET=root          SIZE=80   # root (vda) in place: host blockresize + guest growpart/resize2fs
+make grow-disk VM=rev DISK_TARGET=root-redeploy SIZE=80   # recreate the root bigger (root disposable, /data reattached)
 ```
+
+`SIZE` is the **new** size in GiB; all variants are grow-only. `DISK_TARGET=data` simply
+delegates to `make data-resize`. The host LV must have the free space — a full host is what
+truncates files, so check `df -h /` first. Also in the TUI (`gd`) and the web console
+(Hardware tab → **Grow a disk**).
 
 ### Launch a set of GUI tools at the start of a work session
 
@@ -273,6 +306,8 @@ make destroy VM=rev                    # Terraform destroy (keeps the standalone
 | `Unable to find a satisfying virtiofsd` | the host `virtiofsd` daemon (needed by a virtiofs `SHARE`) isn't installed | `make ensure-virtiofsd` (`full` runs it automatically when a share is requested; `make check` also reports it) |
 | `domain '<vm>' already exists` at apply | a prior failed deploy left the domain defined in libvirt but untracked by Terraform | none needed — `deploy`/`full` now self-heal it before apply (undefine + drop throwaway overlay/cloud-init, keeping `<vm>-data.raw`) |
 | `Could not open .../kali-golden.qcow2: Permission denied` (file is 644) | AppArmor confines qemu and the per-VM profile doesn't include the golden backing file | `make fix-apparmor` (lab: sets `security_driver="none"`), or keep AppArmor by allowing `/var/lib/libvirt/images/** rk,` in `local/abstractions/libvirt-qemu`; `make check` now flags this |
+| `Unable to find required 'unzip'` during provision | a lean golden lacks `unzip`, needed to extract a `.zip` download (e.g. Ghidra) | none needed — `site.yml` now installs `unzip` automatically before extracting any archive download |
+| `Timeout ... waiting for privilege escalation prompt` / `UNREACHABLE` during provision | transient slow-first-`sudo` or SSH hiccup just after boot | none needed — `provision` raises `ANSIBLE_TIMEOUT` (`ATIMEOUT=30`) and auto-retries transient errors (`RETRIES=3`); a real task failure is never retried |
 | `SHARE` change not visible in `/mnt/host` | virtiofs is bound at domain **start** | `make restart VM=<vm>` after changing the share |
 | Need a 2nd shared folder (persistent) | one extra virtiofs device → `/mnt/host2` | redeploy with `SHARE2=<dir>` (tag must differ from `SHARE_TAG`); needs `SPICE=true` |
 | Need a share now, without a reboot | virtiofs device hot-attached to the running VM | `make share VM=<vm> DIR=<host dir> DST=/mnt/host2` (live-only; use `SHARE2=` to persist) |
