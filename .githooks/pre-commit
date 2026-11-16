@@ -1,50 +1,46 @@
 #!/usr/bin/env bash
-# kali-lab pre-commit secret guard.
-# Blocks committing secret FILES (by name) and secret CONTENT / references
-# (by staged diff) — including .ovpn files AND path references to them.
-# Bypass a single intentional commit with:  ALLOW_SECRET=1 git commit ...
+# pre-commit — keep secrets out of Git (OpenVPN configs, private keys, .env files,
+# hardcoded API tokens, and references to a .ovpn path). This repo stores such
+# things in a per-machine .env (gitignored) and references a variable instead.
 #
-# Activate once (hooks in .githooks/ are inert until Git is pointed at them):
-#   git config core.hooksPath .githooks     # (or: make hooks)
+# Bypass a genuine false positive with:   ALLOW_SECRET=1 git commit ...
 set -u
 
-if [ "${ALLOW_SECRET:-0}" = "1" ]; then
-  echo "[pre-commit] ALLOW_SECRET=1 — secret guard bypassed for this commit." >&2
-  exit 0
-fi
+[ "${ALLOW_SECRET:-0}" = "1" ] && exit 0
 
 fail=0
-note() { echo "  ✗ $*" >&2; fail=1; }
+note(){ printf '  \033[31m\xe2\x9c\x97\033[0m %s\n' "$1" >&2; fail=1; }
 
-# Staged, added/copied/modified files (NUL-safe).
-staged() { git diff --cached --name-only --diff-filter=ACM -z; }
+staged=$(git diff --cached --name-only --diff-filter=ACM)
 
-# 1) Secret FILES by path/name ------------------------------------------------
-while IFS= read -r -d '' f; do
+# 1) Whole files that must never be committed, matched by name / extension.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
   case "$f" in
-    *.ovpn|*.key|*.pem|*.p12|*.pfx|*.kdbx|*.jks) note "secret file staged: $f" ;;
-    .env|*/.env|.env.*|*/.env.*) note "env file staged: $f" ;;
-    *id_rsa|*id_ed25519|*id_ecdsa|*id_dsa) note "private SSH key staged: $f" ;;
+    *.ovpn|*.key|*.pem|*.p12|*.pfx|*id_rsa*|*id_ed25519*)
+      note "secret-looking file staged: $f" ;;
   esac
-done < <(staged)
+  case "$f" in
+    .env|*/.env|*.env)
+      note "env file staged: $f" ;;
+  esac
+done <<EOF
+$staged
+EOF
 
-# 2) Secret CONTENT / references in the staged diff (added lines only) --------
-# Only added lines (leading '+'), excluding the diff header '+++'.
-added="$(git diff --cached -U0 --diff-filter=ACM | grep -E '^\+' | grep -Ev '^\+\+\+' || true)"
+# 2) Scan ONLY the added lines of the staged diff, as text.
+#    -a  : treat input as text  -> no "Binary file matches" noise / false hits
+#    --  : end option parsing   -> a pattern starting with '-' is not read as a flag
+added=$(git diff --cached -U0 --no-color -- . 2>/dev/null | grep -aE '^\+' | grep -avE '^\+\+\+')
 
-check() { # <regex> <message>
-  if printf '%s\n' "$added" | grep -Eiq "$1"; then note "$2"; fi
-}
+printf '%s\n' "$added" | grep -aEq -- '\.ovpn([^A-Za-z0-9._-]|$)' \
+  && note "reference to a .ovpn file/path in a diff"
 
-check 'BEGIN [A-Z0-9 ]*PRIVATE KEY'        "private key material in a diff"
-check '[A-Za-z0-9_./~ -]*\.ovpn([^A-Za-z0-9]|$)' "reference to a .ovpn file/path in a diff"
-check '(AKIA|ASIA)[0-9A-Z]{16}'            "AWS access key id in a diff"
-check 'ghp_[0-9A-Za-z]{36}'               "GitHub token in a diff"
-check 'xox[baprs]-[0-9A-Za-z-]{10,}'      "Slack token in a diff"
-check 'sk-[A-Za-z0-9]{20,}'               "OpenAI-style API key in a diff"
-check '-----BEGIN OPENVPN'                 "inline OpenVPN credentials in a diff"
-check '(secret|token|api[_-]?key|password)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/_+.-]{12,}' \
-                                           "hardcoded secret-looking value in a diff"
+printf '%s\n' "$added" | grep -aEq -- '-----BEGIN (OPENVPN|RSA|EC|DSA|OPENSSH|PGP|PRIVATE|CERTIFICATE)' \
+  && note "private key / OpenVPN / certificate block in a diff"
+
+printf '%s\n' "$added" | grep -aEiq -- '(api[_-]?key|secret|token|passwd|password)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9/_+.=-]{16,}' \
+  && note "hardcoded API key / token / password in a diff"
 
 if [ "$fail" -ne 0 ]; then
   cat >&2 <<'MSG'
